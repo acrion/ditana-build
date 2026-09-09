@@ -1,0 +1,14 @@
+[Unit]
+Description=Timer for the Ditana package build
+Documentation=https://github.com/acrion/ditana-build/blob/main/docs/build-host.md
+
+[Timer]
+# Once a day. A collision with the automatic system update no longer needs a
+# fast tick, because maintenance-lock --wait blocks on the lock for up to half
+# an hour.
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

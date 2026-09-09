@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Give a freshly cloned package tree file times that reflect the age of its
+# content.
+#
+#     set-clone-mtimes /path/to/packages
+#
+# git records no modification times, so every file in a new clone carries the
+# moment of the clone. The pipeline decides whether a package needs rebuilding
+# by comparing its artefacts against PKGBUILD and pyproject.toml, so on a newly
+# seeded host every recipe looks newer than the artefact copied next to it, and
+# all 57 packages are rebuilt -- which is the multi-day cold build that seeding
+# exists to avoid.
+#
+# Setting those two files to the time of the last commit that touched them
+# restores the intended meaning: an artefact is newer than the recipe it was
+# built from. Run this after setup-package-clones and after copying the
+# artefacts across.
+
+set -euo pipefail
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+target=${1:-}
+[[ -n $target ]] || die "usage: ${0##*/} /path/to/packages"
+[[ -d $target ]] || die "$target is not a directory"
+
+cd "$target"
+
+stamped=0
+skipped=0
+
+for dir in */; do
+    dir=${dir%/}
+    [[ -d $dir/.git ]] || continue
+
+    # The PKGBUILD is not always at the clone root, and a file that is present
+    # but untracked must not be stamped from a commit that never contained it.
+    mapfile -t files < <(git -C "$dir" ls-files -- 'PKGBUILD' '*/PKGBUILD' 'pyproject.toml')
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo "  $dir: nothing to stamp"
+        (( ++skipped ))
+        continue
+    fi
+
+    for rel in "${files[@]}"; do
+        ts=$(git -C "$dir" log -1 --format=%ct -- "$rel")
+        if [[ -z $ts ]]; then
+            (( ++skipped ))
+            continue
+        fi
+        touch -d "@$ts" "$dir/$rel"
+        (( ++stamped ))
+    done
+done
+
+echo
+echo "Stamped $stamped file(s); skipped $skipped."
+echo "Packages whose artefacts are older than these times will still rebuild,"
+echo "which is correct: their recipe really did change after the last build."

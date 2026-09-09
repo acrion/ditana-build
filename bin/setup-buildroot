@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Prepare a host to build the Ditana repository in a chroot.
+#
+#     setup-buildroot /path/to/packages [build-user]
+#
+# Run once per build host, before the first build. Everything it creates is
+# outside the package tree except the staging repository, which has to be on
+# the same filesystem as the artefacts so that they can be hardlinked into it.
+
+set -euo pipefail
+
+BUILDROOT=/var/lib/ditana-buildroot
+BUILDROOT_CACHE=/var/cache/ditana-buildroot
+PACMAN_CONF=/etc/ditana/pacman-buildroot.conf
+BUILD_CONF=/etc/ditana/package-build.conf
+SUDOERS=/etc/sudoers.d/50-ditana-build
+SIGNING_KEY=3F8054C3FF755E5544E68516BC333E9AE877D45A
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+SHARE=$HERE/../etc
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+packages_dir=${1:-}
+[[ -n $packages_dir ]] || die "usage: ${0##*/} /path/to/packages [build-user]"
+packages_dir=$(readlink -f "$packages_dir")
+[[ -d $packages_dir ]] || die "$packages_dir is not a directory"
+
+build_user=${2:-${SUDO_USER:-}}
+[[ -n $build_user ]] || die "no build user given and \$SUDO_USER is not set"
+
+if [[ $EUID -ne 0 ]]; then
+    exec sudo -- "$0" "$packages_dir" "$build_user"
+fi
+
+id "$build_user" >/dev/null || die "no such user: $build_user"
+
+# makechrootpkg and arch-nspawn are reached through the %wheel rule installed
+# below; without the group membership every build would stop at a password
+# prompt that an unattended run cannot answer.
+if ! id -nG "$build_user" | tr ' ' '\n' | grep -qx wheel; then
+    die "$build_user is not in group 'wheel'. Add with: usermod -aG wheel $build_user"
+fi
+
+for tool in mkarchroot arch-nspawn makechrootpkg repo-add; do
+    command -v "$tool" >/dev/null || die "$tool is missing; install devtools and pacman-contrib"
+done
+
+# Only a host that signs needs the key in its pacman keyring: the pipeline
+# verifies each signature it makes against that keyring, because that is the
+# keyring a user has. A build host holds no secret key, signs nothing, and has
+# nothing to verify -- requiring the key there would be a precondition for a
+# step it never performs.
+if sudo -u "$build_user" gpg --list-secret-keys "$SIGNING_KEY" >/dev/null 2>&1; then
+    if ! pacman-key --list-keys "$SIGNING_KEY" >/dev/null 2>&1; then
+        die "$build_user can sign with $SIGNING_KEY, but that key is not in this
+host's pacman keyring, so the pipeline cannot check that what it signs is
+installable. Install ditana-keyring before continuing."
+    fi
+else
+    echo "--- $build_user holds no secret key for $SIGNING_KEY."
+    echo "    This host can build but not sign; publish-ditana-build does the rest elsewhere."
+fi
+
+repo=$packages_dir/.repo
+
+echo "--- Installing $PACMAN_CONF"
+install -d -m 755 /etc/ditana
+sed -e "s|@REPO@|$repo|" -e "s|@CACHE@|$BUILDROOT_CACHE|" \
+    "$SHARE/pacman-buildroot.conf.in" >"$PACMAN_CONF.new"
+install -m 644 -T "$PACMAN_CONF.new" "$PACMAN_CONF"
+rm -f "$PACMAN_CONF.new"
+
+echo "--- Installing $SUDOERS"
+visudo -cqf "$SHARE/sudoers.d/50-ditana-build" ||
+    die "$SHARE/sudoers.d/50-ditana-build is not valid sudoers syntax"
+install -m 440 -T "$SHARE/sudoers.d/50-ditana-build" "$SUDOERS"
+
+echo "--- Writing $BUILD_CONF"
+# DITANA_SERVERS is kept if the file already names it: it is the one setting
+# here that cannot be derived from this host, and rewriting it on a re-run
+# would silently unpublish the installation.
+existing_servers=""
+if [[ -r $BUILD_CONF ]]; then
+    existing_servers=$(sed -n 's/^DITANA_SERVERS=//p' "$BUILD_CONF" | tail -1)
+fi
+if [[ -n ${DITANA_SERVERS:-} ]]; then
+    existing_servers="\"$DITANA_SERVERS\""
+fi
+existing_build_host=""
+if [[ -r $BUILD_CONF ]]; then
+    existing_build_host=$(sed -n 's/^BUILD_HOST=//p' "$BUILD_CONF" | tail -1)
+fi
+if [[ -n ${BUILD_HOST:-} ]]; then
+    existing_build_host="\"$BUILD_HOST\""
+fi
+
+cat >"$BUILD_CONF" <<EOF
+# Read by ditana-package-build, which the systemd service runs as root, and by
+# the pipeline for the settings that describe this installation rather than the
+# software.
+# Written by setup-buildroot.
+BUILD_USER=$build_user
+PACKAGES_DIR=$packages_dir
+
+# Where the repository is published: a space-separated list of
+# user@host:/document-root, reached over SSH with this host's key. Each
+# document root holds ditana-testing/, versions/, and ditana as a symlink into
+# versions/. Nothing is published while this is empty, and the pipeline says so
+# by name rather than doing nothing quietly.
+DITANA_SERVERS=${existing_servers:-\"\"}
+
+# Only for the arrangement in which this host holds the key and a different one
+# builds: publish-ditana-build fetches that host's artefacts over SSH. Empty on
+# a host that builds for itself.
+BUILD_HOST=${existing_build_host:-\"\"}
+EOF
+chmod 644 "$BUILD_CONF"
+
+# The pipeline empties and refills this directory on every run. It only has to
+# exist, with a readable database, before the very first build: pacman refuses
+# to synchronise a repository whose database file is missing, and mkarchroot
+# below already synchronises.
+if [[ ! -e $repo/ditana.db ]]; then
+    echo "--- Creating the staging repository $repo"
+    install -d -m 755 -o "$build_user" -g "$(id -gn "$build_user")" "$repo"
+    sudo -u "$build_user" tar czf "$repo/ditana.db.tar.gz" --files-from /dev/null
+    sudo -u "$build_user" ln -sf ditana.db.tar.gz "$repo/ditana.db"
+fi
+
+# The pipeline removes a package's name from here as it stages it, so the
+# directory belongs to the build user rather than to root.
+echo "--- Creating the chroot package cache $BUILDROOT_CACHE"
+install -d -m 755 -o "$build_user" -g "$(id -gn "$build_user")" "$BUILDROOT_CACHE"
+
+if [[ -d $BUILDROOT/root ]]; then
+    # Its baked-in copy of the configuration may name a different package tree.
+    # update_buildroot() refreshes it from $PACMAN_CONF at the start of every
+    # run, so it is corrected before the first build rather than here.
+    echo "--- $BUILDROOT/root already exists, leaving it alone"
+else
+    echo "--- Creating $BUILDROOT/root (downloads base-devel, takes a few minutes)"
+    install -d -m 755 "$BUILDROOT"
+    mkarchroot -C "$PACMAN_CONF" "$BUILDROOT/root" base-devel
+fi
+
+cat <<EOF
+
+Done. This host can now build in the chroot.
+
+  Build tree:  $packages_dir
+  Staging:     $repo
+  Chroot:      $BUILDROOT/root
+
+On a filesystem without btrfs snapshots -- the workstation's /var/lib is ZFS --
+makechrootpkg -c falls back to rsyncing the chroot for every package it builds.
+That costs about a minute per rebuilt package and nothing on the days when
+nothing is rebuilt.
+
+For the unattended build, install systemd/* into /etc/systemd/system/ and
+enable ditana-package-build.timer.
+EOF

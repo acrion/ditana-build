@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# What the wrapper does with its own flags.
+#
+# The argument handling is lifted out of the real script rather than reproduced,
+# so that what is tested is what runs -- all of it, between the two markers the
+# script carries for the purpose. An earlier version lifted the loop and stopped
+# one line short of the default that reads its result, asserted that the list was
+# empty and called that correct. It is correct, right up to the line it did not
+# lift, which turned the empty list into --build-only and made the first run of
+# the full chain sign nothing, upload nothing, and test a repository three weeks
+# old. A slice that quietly drifts smaller is worse than no test at all, so the
+# markers are checked and their absence is a failure.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+WRAPPER=$HERE/ditana-package-build
+[[ -f $WRAPPER ]] || { echo "FAIL: $WRAPPER is missing"; exit 1; }
+
+loop=$(sed -n '/^# --- BEGIN argument-handling/,/^# --- END argument-handling/p' "$WRAPPER")
+[[ -n $loop ]] ||
+    { echo "FAIL: the argument handling markers are gone from $WRAPPER"; exit 1; }
+grep -q 'END argument-handling' <<<"$loop" ||
+    { echo "FAIL: only half of the argument handling could be lifted out"; exit 1; }
+
+pass=0; fail=0
+#| Run the lifted loop over one command line and print what it decided.
+decide() {
+    local script="die() { echo \"died: \$*\"; exit 3; }
+$loop
+echo \"args=\${args[*]-} test=\$run_test_install release=\$release_after_test quoted=[\$quoted]\""
+    bash -c "$script" -- "$@" 2>&1
+}
+is() {
+    if [[ "$2" == "$3" ]]; then printf '  ok   %s\n' "$1"; pass=$((pass+1))
+    else printf '  FAIL %s\n    expected: %s\n    got:      %s\n' "$1" "$3" "$2"; fail=$((fail+1)); fi
+}
+
+is "a bare build passes everything through" \
+   "$(decide --build-only)" \
+   "args=--build-only test=n release=n quoted=[ --build-only]"
+
+# The default exists so that a misconfigured unit cannot publish by accident.
+is "no arguments at all still means build-only" \
+   "$(decide)" \
+   "args=--build-only test=n release=n quoted=[ --build-only]"
+
+is "--then-test-install is taken out, not passed on" \
+   "$(decide --build-only --then-test-install)" \
+   "args=--build-only test=y release=n quoted=[ --build-only]"
+
+# The release step needs a verdict, and only the test installation writes one.
+# And the argument list must stay empty here rather than falling back to
+# --build-only: this run has to sign and upload, or there is nothing to test.
+is "--release-after-test implies the test installation, and does not become build-only" \
+   "$(decide --release-after-test)" \
+   "args= test=y release=y quoted=[]"
+
+is "--build-only together with --release-after-test is refused" \
+   "$(decide --release-after-test --build-only)" \
+   "died: --build-only signs and uploads nothing, so the test installation would install the previous state and the release would mean nothing"
+
+# --release lives inside the pipeline and therefore runs before the test that is
+# supposed to gate it. Silently accepting it here would release a run on the
+# strength of the previous run's verdict.
+is "--release is refused rather than quietly reordered" \
+   "$(decide --release --then-test-install)" \
+   "died: --release releases before the test installation; use --release-after-test"
+
+is "an unknown flag is left for the pipeline to reject" \
+   "$(decide --no-such-flag)" \
+   "args=--no-such-flag test=n release=n quoted=[ --no-such-flag]"
+
+# The unit is the only caller that runs unattended, so what it asks for is
+# never read by anyone until something is wrong. It asked for
+# --build-only --then-test-install for weeks: a chain that signs nothing,
+# uploads nothing and then installs a testing repository from some earlier day,
+# whose verdict says nothing about the run that wrote it. Both flags are legal
+# on their own, so only what they decide together catches it.
+#
+# There are two ExecStart lines now -- the unit, and the drop-in that wraps it
+# in the maintenance lock -- because a drop-in cannot wrap a command, it can
+# only replace it. So the flags are written twice, and the point of testing
+# them here is that they are written twice.
+#| Every ExecStart in systemd/, with line continuations joined, reduced to what
+#| it passes to ditana-package-build.
+unit_flags() {
+    awk '/\\$/ { line = line substr($0, 1, length($0) - 1); next }
+         { print line $0; line = "" }' "$1" |
+    sed -n 's|^ExecStart=.*/ditana-package-build \(.*\)$|\1|p'
+}
+
+mapfile -t UNIT_FILES < <(find "$HERE/../systemd" -type f 2>/dev/null | sort)
+asked=()
+for unit in "${UNIT_FILES[@]}"; do
+    while read -r flags; do
+        [[ -n $flags ]] && asked+=("$flags")
+    done < <(unit_flags "$unit")
+done
+
+is "both the unit and its drop-in name a run" "${#asked[@]}" "2"
+if (( ${#asked[@]} >= 2 )); then
+    # A drop-in that has drifted from the unit it overrides is the failure this
+    # arrangement can produce and the unit alone cannot: the host would run one
+    # thing and the repository would describe another.
+    is "and they ask for the same one" "${asked[0]}" "${asked[1]}"
+fi
+for flags in "${asked[@]}"; do
+    # shellcheck disable=SC2086
+    is "what systemd asks for signs, tests and releases: $flags" \
+       "$(decide $flags)" \
+       "args= test=y release=y quoted=[]"
+done
+
+echo
+echo "--- $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

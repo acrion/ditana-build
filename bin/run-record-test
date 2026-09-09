@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Control for the run record: what is written into it, and that it leaves the
+# machine that wrote it.
+#
+# The record exists to be read on ditana.org, so a record that is written and
+# not uploaded is never what anybody wanted. It happened twice all the same --
+# ditana-test-install carried a writer of its own, and release-after-test
+# stamped a release into fields that belong to the per-package entries rather
+# than to the run, so the dashboard went on saying "in testing" about a set of
+# packages that was live in production. Both are pinned below by name.
+#
+# The scripts really run; only ssh and rsync are replaced, by programs on PATH
+# that record their arguments. That is a legitimate state and not a broken one:
+# copy_to_servers() and release-to-production.sh find both through PATH exactly
+# as they do in a real run, and what this asks is what they were told to do.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+WORK=$(mktemp -d) || { echo "FAIL: no temporary directory"; exit 1; }
+trap 'rm -rf "$WORK"' EXIT
+
+pass=0; fail=0
+ok() { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no() { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+is() { if [[ $2 == "$3" ]]; then ok "$1"; else no "$1 (want [$3], got [$2])"; fi }
+
+# ssh and rsync, replaced. FAKE_EXIT lets a test make the servers unreachable
+# without touching anything else.
+mkdir -p "$WORK/bin"
+for tool in ssh rsync; do
+    cat > "$WORK/bin/$tool" <<EOF
+#!/usr/bin/env bash
+printf '%s %s\n' "$tool" "\$*" >> "$WORK/calls.log"
+exit \${FAKE_EXIT:-0}
+EOF
+    chmod +x "$WORK/bin/$tool"
+done
+export PATH=$WORK/bin:$PATH
+
+# Every path below reaches pipeline.notify(), and on a workstation with a
+# transport configured in /etc/ditana/maintenance.conf that is a push to a
+# phone. Running the suite sent seven of them once. ditana-notify reads this
+# variable before the system file, and an empty NOTIFY_COMMAND is its
+# documented "nothing configured" case: the message is printed and delivered
+# nowhere.
+cat > "$WORK/maintenance.conf" <<'EOF'
+NOTIFY_COMMAND=""
+NOTIFY_PREFIX="run-record-test"
+EOF
+export DITANA_MAINTENANCE_CONF=$WORK/maintenance.conf
+
+# Where this installation publishes. It is configuration rather than source
+# since the repository became publishable, so a suite that drives the pipeline
+# has to name it -- and naming two servers is also what lets the assertions
+# below tell "reached the servers" from "reached a server".
+cat > "$WORK/package-build.conf" <<EOF
+DITANA_SERVERS="root@one.invalid:/srv/one root@two.invalid:/srv/two"
+EOF
+export DITANA_BUILD_CONF=$WORK/package-build.conf
+
+RUN=2026-01-02T03-04-05Z.json
+
+fixture() {   # a package tree holding one run, in the state the build host leaves
+    rm -rf "$WORK/tree" "$WORK/calls.log"
+    mkdir -p "$WORK/tree/build-runs/logs"
+    echo "a log line" > "$WORK/tree/build-runs/logs/some-package.log"
+    cat > "$WORK/tree/build-runs/$RUN" <<EOF
+{"started": "2026-01-02T03:04:05+00:00",
+ "finished": "2026-01-02T04:04:05+00:00",
+ "seconds": 3600.0,
+ "outcome": "in-testing",
+ "message": "1 package(s) rebuilt",
+ "counts": {"rebuilt": 1, "current": 0, "review-stopped": 0, "build-failed": 0},
+ "test-install": ${1:-null},
+ "packages": [{"name": "001-example", "status": "rebuilt", "detail": "", "seconds": 1}]}
+EOF
+    cat > "$WORK/tree/build-runs/index.json" <<EOF
+{"runs": [{"started": "2026-01-02T03:04:05+00:00",
+           "finished": "2026-01-02T04:04:05+00:00",
+           "seconds": 3600.0,
+           "outcome": "in-testing",
+           "counts": {"rebuilt": 1, "current": 0, "review-stopped": 0, "build-failed": 0},
+           "file": "$RUN"}]}
+EOF
+}
+
+field() { python -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], '<absent>'))" "$1" "$2"; }
+index_field() { python -c "import json,sys; print(json.load(open(sys.argv[1]))['runs'][0].get(sys.argv[2], '<absent>'))" "$1" "$2"; }
+
+PASSED='{"result": "passed", "finished": "2026-01-02T04:30:00+00:00", "iso": "x.iso"}'
+
+echo "a release after a passing test installation:"
+fixture "$PASSED"
+"$HERE/release-after-test" --packages "$WORK/tree" > "$WORK/out" 2>&1
+is "it succeeds" "$?" "0"
+
+# The defect this pins: the run record's vocabulary is outcome/message, while
+# status/detail belong to the per-package entries inside it. Both names live in
+# the same file, one level apart, and the release was stamped into the wrong
+# pair -- so it was written, uploaded, and invisible.
+is "the run says released"            "$(field "$WORK/tree/build-runs/$RUN" outcome)" "released"
+is "the index says released too"      "$(index_field "$WORK/tree/build-runs/index.json" outcome)" "released"
+is "no stray status field on the run" "$(field "$WORK/tree/build-runs/$RUN" status)" "<absent>"
+is "the reason is in message"         "$(field "$WORK/tree/build-runs/$RUN" message)" \
+   "released from the build host after a passing test installation"
+
+# The second defect: stamping without uploading. The record is the dashboard's
+# only source, and it is on the servers.
+uploaded=$(grep -c "rsync .*build-runs.*/build-history/" "$WORK/calls.log")
+[[ ${uploaded:-0} -ge 2 ]] && ok "the record reaches both servers" \
+                           || no "the record reaches both servers (rsync calls: ${uploaded:-0})"
+grep -q "rsync .*logs.*build-history" "$WORK/calls.log" \
+    && ok "and the logs go with it" || no "and the logs go with it"
+# release-to-production.sh pipes a script into `ssh HOST bash`; copy_to_servers
+# reaches the same hosts with `ssh HOST mkdir -p`. So the two are told apart by
+# what they asked for, not by counting.
+is "production was released on both servers" \
+   "$(grep -c ' bash$' "$WORK/calls.log")" "2"
+# And in that order. A record that claims a release the servers never performed
+# is the one failure this whole gate exists to prevent.
+last_release=$(grep -n ' bash$' "$WORK/calls.log" | tail -1 | cut -d: -f1)
+first_upload=$(grep -n '^rsync ' "$WORK/calls.log" | head -1 | cut -d: -f1)
+[[ -n $last_release && -n $first_upload && $last_release -lt $first_upload ]] \
+    && ok "and before the record said so" \
+    || no "and before the record said so (release $last_release, upload $first_upload)"
+
+echo
+echo "when the servers cannot be reached:"
+fixture "$PASSED"
+FAKE_EXIT=1 "$HERE/release-after-test" --packages "$WORK/tree" > "$WORK/out2" 2>&1
+# A failing release-to-production.sh is a failed release, and the record has to
+# say so rather than claim a production that did not happen.
+is "a failed release is reported as failed" "$?" "1"
+is "and the run stays in testing" "$(field "$WORK/tree/build-runs/$RUN" outcome)" "in-testing"
+
+echo
+echo "when only the record upload fails:"
+fixture "$PASSED"
+# release-to-production.sh reaches the servers with ssh, copy_to_servers with
+# rsync. Breaking rsync alone is the case where production really was replaced
+# and only the record could not follow -- which must not turn a completed
+# release into a failed one.
+cat > "$WORK/bin/rsync" <<EOF
+#!/usr/bin/env bash
+printf 'rsync %s\n' "\$*" >> "$WORK/calls.log"
+exit 1
+EOF
+chmod +x "$WORK/bin/rsync"
+"$HERE/release-after-test" --packages "$WORK/tree" > "$WORK/out3" 2>&1
+is "the release still counts as done" "$?" "0"
+is "and the local record says released" "$(field "$WORK/tree/build-runs/$RUN" outcome)" "released"
+grep -qi "not published" "$WORK/out3" \
+    && ok "the unpublished record is reported" || no "the unpublished record is reported"
+cat > "$WORK/bin/rsync" <<EOF
+#!/usr/bin/env bash
+printf 'rsync %s\n' "\$*" >> "$WORK/calls.log"
+exit \${FAKE_EXIT:-0}
+EOF
+chmod +x "$WORK/bin/rsync"
+
+echo
+echo "what is refused:"
+fixture '{"result": "failed", "detail": "did not boot"}'
+"$HERE/release-after-test" --packages "$WORK/tree" > "$WORK/out4" 2>&1
+is "a failed test installation refuses the release" "$?" "1"
+is "and nothing is stamped" "$(field "$WORK/tree/build-runs/$RUN" outcome)" "in-testing"
+[[ ! -s $WORK/calls.log ]] && ok "and no server was touched at all" \
+                           || no "and no server was touched at all"
+
+fixture null
+"$HERE/release-after-test" --packages "$WORK/tree" > "$WORK/out5" 2>&1
+is "a run with no verdict is refused" "$?" "1"
+fixture null
+"$HERE/release-after-test" --packages "$WORK/tree" --untested > "$WORK/out6" 2>&1
+is "--untested releases it" "$?" "0"
+is "and it says released" "$(field "$WORK/tree/build-runs/$RUN" outcome)" "released"
+
+echo
+echo "when the server list is written across two lines:"
+# The shape a person writes when the list is longer than a line, and the shape
+# the shell accepts. The pipeline read only the first line of it once, and
+# uploaded to a host whose name began with a quotation mark.
+fixture "$PASSED"
+cat > "$WORK/package-build.conf" <<EOF
+DITANA_SERVERS="root@one.invalid:/srv/one
+root@two.invalid:/srv/two"
+EOF
+"$HERE/release-after-test" --packages "$WORK/tree" > "$WORK/out8" 2>&1
+is "it succeeds" "$?" "0"
+is "and both servers were reached" \
+   "$(grep -c 'rsync .*build-runs.*/build-history/' "$WORK/calls.log")" "2"
+grep -q 'rsync .*"root@' "$WORK/calls.log" && no "a quote reached a host name" \
+                                           || ok "no quote reached a host name"
+cat > "$WORK/package-build.conf" <<EOF
+DITANA_SERVERS="root@one.invalid:/srv/one root@two.invalid:/srv/two"
+EOF
+
+echo
+echo "when this installation publishes nowhere:"
+# The addresses left the source so that the repository could be published, and
+# an unconfigured list must stop the run by name. An empty list would make
+# copy_to_servers() a no-op, and a run that publishes to nothing and reports
+# success is the one outcome the all-or-nothing rule must never produce.
+fixture "$PASSED"
+printf '# no servers here\n' > "$WORK/package-build.conf"
+"$HERE/release-after-test" --packages "$WORK/tree" > "$WORK/out7" 2>&1
+is "a run with no servers configured fails" "$?" "1"
+grep -q "DITANA_SERVERS" "$WORK/out7" && ok "and says which setting is missing" \
+                                      || no "and says which setting is missing"
+is "and the record is not stamped released" \
+   "$(field "$WORK/tree/build-runs/$RUN" outcome)" "in-testing"
+cat > "$WORK/package-build.conf" <<EOF
+DITANA_SERVERS="root@one.invalid:/srv/one root@two.invalid:/srv/two"
+EOF
+
+echo
+echo "what the test installation leaves behind:"
+# The harness photographs the guest at the moment it gives up, into a work
+# directory the next run deletes. Until this, no picture ever left the build
+# host -- and it is the only thing that shows an installer sitting at a dialog,
+# because the serial log falls silent once the medium's bootloader hands over.
+python - "$HERE" "$WORK" <<'PY' > "$WORK/verdict-out" 2>&1
+import importlib.machinery, importlib.util, os, sys
+here, work = sys.argv[1], sys.argv[2]
+loader = importlib.machinery.SourceFileLoader(
+    "ditana_test_install", os.path.join(here, "ditana-test-install"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+# The harness appends one line per transition, so the file of a run that was
+# killed halfway looks exactly like this.
+wd = os.path.join(work, "harness")
+os.makedirs(wd, exist_ok=True)
+with open(os.path.join(wd, "progress"), "w") as fh:
+    fh.write("stage installing\ninstall-seconds 1832\nstage installed\n")
+open(os.path.join(wd, "screen.png"), "wb").write(b"not really a png")
+
+fields = m.progress(wd)
+print("stage:", fields["stage"])
+print("install-seconds:", fields["install-seconds"])
+print("no progress file:", m.progress(os.path.join(work, "nothing")))
+
+records = os.path.join(work, "tree", "build-runs")
+rel = m.keep_screenshot(wd, records, "2026-01-02T03-04-05Z")
+print("path:", rel)
+print("exists:", os.path.exists(os.path.join(records, rel)))
+print("mode:", oct(os.stat(os.path.join(records, rel)).st_mode & 0o777))
+print("dir mode:", oct(os.stat(os.path.dirname(
+    os.path.join(records, rel))).st_mode & 0o777))
+print("nothing to keep:", m.keep_screenshot(os.path.join(work, "nothing"),
+                                            records, "x"))
+PY
+out=$(cat "$WORK/verdict-out")
+is "the last stage written wins"  "$(grep '^stage:' <<<"$out")" "stage: installed"
+is "and the timing comes with it" "$(grep '^install-seconds:' <<<"$out")" "install-seconds: 1832"
+# A harness that died before starting the guest leaves no file, and that is an
+# answer rather than an error: nothing was installed.
+is "a missing progress file is empty, not fatal" \
+   "$(grep '^no progress file:' <<<"$out")" "no progress file: {}"
+# Under logs/<stem>/, because prune_logs() drops exactly that directory when
+# the run falls out of the rolling index. Anywhere else the pictures would
+# accumulate on the servers forever.
+is "the screenshot lands under the run own logs" \
+   "$(grep '^path:' <<<"$out")" "path: logs/2026-01-02T03-04-05Z/test-install/screen.png"
+is "and is really there"          "$(grep '^exists:' <<<"$out")" "exists: True"
+# Ditana umask is 027 and rsync preserves the mode: a directory the web server
+# may not traverse turns every link below it into a 404.
+is "readable by the web server"   "$(grep '^mode:' <<<"$out")" "mode: 0o644"
+is "and so is the directory above it" "$(grep '^dir mode:' <<<"$out")" "dir mode: 0o755"
+is "a run that left no picture reports none" \
+   "$(grep '^nothing to keep:' <<<"$out")" "nothing to keep: None"
+
+echo
+echo "one writer, not several:"
+# ditana-test-install used to write the verdict itself, with a copy of the code
+# that did not upload. The grep is the point: a second writer anywhere in bin/
+# is the defect, whatever it is called.
+others=$(grep -ln 'build-runs' "$HERE"/* 2>/dev/null |
+         xargs grep -l 'json.dump' 2>/dev/null |
+         grep -v '/publish-ditana-build$' | grep -v '/build-ditana-packages$' |
+         grep -v -- '-test$' | sed "s|$HERE/||" | tr '\n' ' ')
+is "no script besides the pipeline and publish writes a record" "${others% }" ""
+
+python - "$HERE" <<'PY'
+import importlib.machinery, importlib.util, os, sys
+here = sys.argv[1]
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"),
+                                                  os.path.join(here, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+sys.exit(0 if not hasattr(load("ditana-test-install"), "stamp") else 1)
+PY
+is "ditana-test-install carries no stamp of its own" "$?" "0"
+
+echo
+echo "--- $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

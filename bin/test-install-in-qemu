@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Install Ditana unattended into a local QEMU virtual machine and say whether
+# it worked.
+#
+#     test-install-in-qemu <iso> <answer-file.kdl> [work-dir]
+#
+# The step between building a repository and releasing it: a medium that
+# builds, signs and uploads can still be one nobody can install from, and until
+# now the only thing that noticed was Stefan doing it by hand.
+#
+# The guest is driven by an answer file on a config drive -- a small FAT image
+# labelled DITANA_AUTO that the installer finds by itself. No keystrokes are
+# simulated, because the same mechanism has to serve a hosting provider
+# installing Ditana over PXE, and a provider cannot be sent keystrokes.
+#
+# There are two verdicts, and both have to come out right.
+#
+# The first is that the installation finishes: the installer's last step is a
+# reboot, -no-reboot makes QEMU exit instead of going round again, and
+# anything that stops it earlier -- a question the answer file does not cover,
+# a package that will not install -- leaves the guest sitting there until the
+# deadline.
+#
+# The second is that what was installed comes up. An installation can write
+# every file correctly and still produce a machine that never boots, and that
+# is exactly the kind of ISO nobody wants released. So the disk is booted on
+# its own afterwards and has to answer on port 22.
+
+set -euo pipefail
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+ISO=${1:-}
+ANSWER_FILE=${2:-}
+WORK_DIR=${3:-/var/tmp/ditana-test-install}
+
+[[ -n $ISO && -n $ANSWER_FILE ]] || die "usage: ${0##*/} <iso> <answer-file.kdl> [work-dir]"
+[[ -f $ISO ]] || die "$ISO does not exist"
+[[ -f $ANSWER_FILE ]] || die "$ANSWER_FILE does not exist"
+
+# Long enough for a package set to be downloaded and installed over whatever
+# link the build host has, short enough that a wedged run does not hold the
+# maintenance lock all day. A run that hits this is a failure either way: the
+# question is only how long it takes to find out.
+#
+# The measured figure on the build VM -- two of its four cores, a domestic
+# link -- is a little under an hour for a server profile: 4.6 GB fetched, a
+# ZFS pool created, the ZFS module built by DKMS inside the target. An hour
+# was therefore the wrong ceiling, being also the expected duration. This is
+# half again as much.
+TIMEOUT=${DITANA_TEST_INSTALL_TIMEOUT:-5400}
+# How long the medium is watched on its own, with nothing attached that could
+# answer for a person. Long enough for it to boot and for an installation that
+# was going to start to have started -- the installer reads its answers within
+# seconds of coming up -- and short enough to sit in front of every run.
+MEDIUM_TIMEOUT=${DITANA_TEST_MEDIUM_TIMEOUT:-180}
+DISK_SIZE=${DITANA_TEST_INSTALL_DISK:-64G}
+MEMORY=${DITANA_TEST_INSTALL_MEMORY:-4G}
+
+for tool in qemu-system-x86_64 qemu-img mkfs.fat mcopy; do
+    command -v "$tool" >/dev/null || die "$tool is missing"
+done
+
+[[ -w /dev/kvm ]] || die "/dev/kvm is not writable; nested virtualisation has to be on"
+
+# Both drives carry a serial, which is what gives them an entry under
+# /dev/disk/by-id in the guest. ZFS is installed by importing the pool from
+# there -- stable names rather than whatever vdX the kernel hands out this
+# boot -- and a virtio disk without a serial has no such entry at all: the
+# import found no pool and the installation stopped one step after creating
+# it. Every real disk has an identity; a test machine whose disks have none
+# is not testing the same thing.
+#
+# The firmware the installed system will boot with. Ditana installs a UEFI
+# bootloader, so a BIOS guest would install and then fail to come up, which is
+# the one outcome this must not report as success.
+OVMF_CODE=""
+for candidate in /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+                 /usr/share/edk2/x64/OVMF_CODE.fd \
+                 /usr/share/OVMF/OVMF_CODE.fd; do
+    [[ -f $candidate ]] && { OVMF_CODE=$candidate; break; }
+done
+[[ -n $OVMF_CODE ]] || die "no OVMF firmware found (pacman -S edk2-ovmf)"
+
+OVMF_VARS_TEMPLATE=${OVMF_CODE%CODE*}VARS${OVMF_CODE#*CODE}
+[[ -f $OVMF_VARS_TEMPLATE ]] || die "$OVMF_VARS_TEMPLATE is missing beside $OVMF_CODE"
+
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR"
+
+DISK=$WORK_DIR/root.qcow2
+CONFIG_DRIVE=$WORK_DIR/config-drive.img
+VARS=$WORK_DIR/OVMF_VARS.fd
+LOG=$WORK_DIR/qemu.log
+MONITOR=$WORK_DIR/monitor.sock
+SCREEN=$WORK_DIR/screen.ppm
+PROGRESS=$WORK_DIR/progress
+
+# How far the run got, in one word per line, appended as it happens rather than
+# summarised at the end -- a run that is killed has to leave the same answer as
+# one that finishes. The caller reads the last `stage` line.
+#
+#     checking-medium  the medium is booting with nothing attached, to see
+#                      whether it installs without being asked
+#     installing       the medium is running; nothing has been installed yet
+#     installed        the installer reached its final reboot
+#     booted           the installed system answered on port 22, which is a pass
+#
+# The distinction is the whole value of the second half of this script: an
+# installation that writes every file correctly and then does not come up
+# fails at `installed`, and "it does not boot" is a different bug report from
+# "it does not install".
+record() { printf '%s %s\n' "$1" "$2" >> "$PROGRESS"; }
+
+# The serial log holds the firmware and the boot menu and then falls silent:
+# the medium boots without console=ttyS0, so everything the installer draws
+# goes to the virtual screen and nowhere else. A run that stops therefore
+# leaves no explanation at all -- unless the screen itself is captured, which
+# is what the monitor socket is for. Adding console=ttyS0 instead would mean
+# booting the kernel past the medium's own bootloader, and then the test would
+# no longer be testing the medium.
+screendump() {
+    [[ -S $MONITOR ]] || return 0
+    python3 - "$MONITOR" "$SCREEN" <<'PY' || return 0
+import socket, sys, time
+monitor, target = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect(monitor)
+time.sleep(0.3)
+try:
+    s.recv(65536)          # the monitor's greeting
+except OSError:
+    pass
+s.sendall(("screendump %s\n" % target).encode())
+time.sleep(1.5)            # QEMU writes the file after acknowledging
+PY
+    [[ -f $SCREEN ]] || return 0
+    # A PPM is awkward to look at over ssh; a PNG is not, and the tool is
+    # already here for the ISO build.
+    if command -v magick >/dev/null; then
+        magick "$SCREEN" "${SCREEN%.ppm}.png" 2>/dev/null && rm -f "$SCREEN" \
+            && { echo "The guest's screen at that moment: ${SCREEN%.ppm}.png" >&2; return 0; }
+    fi
+    echo "The guest's screen at that moment: $SCREEN" >&2
+}
+
+# --- BEGIN medium-verdict ----------------------------------------------------
+# Lifted by bin/test-install-in-qemu-test, which cuts between BEGIN and END.
+#
+#| How many extents of a qcow2 image hold data. An installation that has begun
+#| has written a partition table at the very least, and qcow2 allocates only
+#| what is written, so nothing written is nothing allocated.
+written_extents() {
+    python3 - "$1" <<'PY'
+import json, subprocess, sys
+out = subprocess.run(["qemu-img", "map", "--output=json", sys.argv[1]],
+                     capture_output=True, text=True).stdout
+print(sum(1 for e in json.loads(out or "[]") if e.get("data")))
+PY
+}
+
+#| Whether the medium behaved, given what watching it produced. Two failures,
+#| because an installation that is merely under way has not exited yet: one for
+#| a medium that ran to its final reboot on its own, one for a medium that had
+#| begun writing when the clock ran out.
+#|
+#| written_extents defaults to 1 rather than 0 when it produced nothing at all:
+#| a check that cannot be carried out is not a check that passed.
+medium_verdict() {
+    if (( medium_finished )); then
+        die "The medium installed by itself: it reached its final reboot with no answer file attached. An ISO that does this erases the first machine it is booted on."
+    fi
+    if (( ${medium_written:-1} != 0 )); then
+        die "The medium wrote to the disk with no answer file attached ($medium_written extent(s)). An installation it was never asked for had already begun."
+    fi
+}
+# --- END medium-verdict ------------------------------------------------------
+
+# --- BEGIN autoinstall-abort -------------------------------------------------
+# Lifted by bin/test-install-in-qemu-test, which cuts between BEGIN and END.
+#
+#| The line an unattended installer writes to the serial console when it stops.
+#|
+#| Written by announce-unattended-abort() in the installer's Autoinstall.rakumod;
+#| the string is repeated there and here because the two live in different
+#| repositories and there is nothing for them to share. A change on one side
+#| alone does not break anything -- it costs this harness its speed, and the run
+#| goes back to being reported as a timeout.
+AUTOINSTALL_ABORT_MARKER='DITANA-AUTOINSTALL-ABORT:'
+
+#| What the installer said, or nothing.
+#|
+#| The serial log is the only thing a guest can say while it is still running. An
+#| answer file the installer refuses leaves the medium sitting at a prompt that
+#| nobody is there to answer, and without this the run was indistinguishable from
+#| a hang: 5400 seconds, then "it never reached the reboot that ends an
+#| installation" -- true, and saying nothing about the answer file.
+#|
+#| -a because the log is a raw console capture and holds escape sequences that
+#| cause grep to interpret it as binary; the \r is the console's, not the
+#| message's.
+#|
+#| A newline is put in front of every marker before anything else happens, and
+#| that is not cosmetic. The guest draws its boot menu with escape sequences and
+#| no newlines at all, so the first marker arrives glued to fourteen kilobytes
+#| of menu on one physical line. Matching per line and cutting at the last
+#| marker strips that menu -- and would also throw away every message but the
+#| last one whenever two of them share a line.
+autoinstall_abort() {
+    local log=$1 lines
+    [[ -f $log ]] || return 1
+    lines=$(sed -e "s/$AUTOINSTALL_ABORT_MARKER/\n&/g" "$log" 2>/dev/null \
+            | grep -a -- "$AUTOINSTALL_ABORT_MARKER" 2>/dev/null) || return 1
+    [[ -n $lines ]] || return 1
+    printf '%s\n' "$lines" | sed -e "s/.*$AUTOINSTALL_ABORT_MARKER *//" -e 's/\r$//'
+}
+# --- END autoinstall-abort ---------------------------------------------------
+
+# --- the medium must ask -----------------------------------------------------
+# Before anything is installed on purpose: boot the medium with a disk and
+# nothing else, and require that it does not install anything.
+#
+# The installer takes its answers from the kernel command line, then from a
+# volume labelled DITANA_AUTO, then from autoinstall.kdl beside itself -- which
+# in an ISO is /root/autoinstall.kdl. The last of those is the one nobody sees:
+# in a checkout that path is airootfs/root/, the directory the ISO is built
+# from, and it is in .gitignore because it is also where the mechanism is
+# exercised by hand. A draft answer file left there in August went into every
+# ISO built afterwards, and every one of them would have installed Ditana onto
+# nvme1n1, unattended, on the first machine it was booted on.
+#
+# The installation below cannot see that: it attaches a config drive, and the
+# config drive wins. Only a boot with nothing attached can.
+MEDIUM_DISK=$WORK_DIR/medium-probe.qcow2
+MEDIUM_VARS=$WORK_DIR/OVMF_VARS-medium.fd
+MEDIUM_LOG=$WORK_DIR/qemu-medium.log
+qemu-img create -f qcow2 "$MEDIUM_DISK" "$DISK_SIZE" >/dev/null
+cp "$OVMF_VARS_TEMPLATE" "$MEDIUM_VARS"
+
+record stage checking-medium
+echo "Booting $(basename "$ISO") with nothing attached, for ${MEDIUM_TIMEOUT}s."
+
+set +e
+qemu-system-x86_64 \
+        -enable-kvm \
+        -machine q35 \
+        -cpu host \
+        -smp 2 \
+        -m "$MEMORY" \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+        -drive if=pflash,format=raw,file="$MEDIUM_VARS" \
+        -drive file="$MEDIUM_DISK",format=qcow2,if=none,id=root0 \
+        -device virtio-blk-pci,drive=root0,serial=ditana-test-root \
+        -cdrom "$ISO" \
+        -boot d \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
+        -display none \
+        -serial "file:$MEDIUM_LOG" \
+        -monitor "unix:$MONITOR,server,nowait" \
+        -no-reboot &
+medium_pid=$!
+
+medium_finished=0
+medium_deadline=$((SECONDS + MEDIUM_TIMEOUT))
+while kill -0 "$medium_pid" 2>/dev/null; do
+    if (( SECONDS >= medium_deadline )); then break; fi
+    sleep 5
+done
+if kill -0 "$medium_pid" 2>/dev/null; then
+    # Still sitting there, which is what an installer waiting for a person
+    # looks like from outside. Photograph it first: on a failure the picture is
+    # the only thing that says which dialog it is waiting at.
+    screendump
+    kill "$medium_pid" 2>/dev/null
+else
+    # It ended by itself. The installer's last step is a reboot and -no-reboot
+    # turns that into an exit, so this is an installation that ran to the end
+    # without anybody answering anything.
+    medium_finished=1
+fi
+wait "$medium_pid" 2>/dev/null
+set -e
+
+medium_written=$(written_extents "$MEDIUM_DISK")
+medium_verdict
+echo "The medium asked rather than installing. Continuing with the real one."
+rm -f "$MEDIUM_DISK" "$MEDIUM_VARS"
+# --- end of the medium must ask ----------------------------------------------
+
+qemu-img create -f qcow2 "$DISK" "$DISK_SIZE" >/dev/null
+cp "$OVMF_VARS_TEMPLATE" "$VARS"
+
+# Same image the operator of a hosting provider would attach, built the same
+# way -- see make-config-drive in ditana-installer, which this deliberately
+# repeats rather than depends on: the two repositories are checked out
+# independently on a build host.
+truncate -s 1M "$CONFIG_DRIVE"
+mkfs.fat -n DITANA_AUTO "$CONFIG_DRIVE" >/dev/null
+mcopy -i "$CONFIG_DRIVE" "$ANSWER_FILE" ::autoinstall.kdl
+
+echo "Installing $(basename "$ISO") into $DISK, driven by $(basename "$ANSWER_FILE")."
+record stage installing
+install_started=$SECONDS
+
+set +e
+qemu-system-x86_64 \
+        -enable-kvm \
+        -machine q35 \
+        -cpu host \
+        -smp 2 \
+        -m "$MEMORY" \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+        -drive if=pflash,format=raw,file="$VARS" \
+        -drive file="$DISK",format=qcow2,if=none,id=root0 \
+        -device virtio-blk-pci,drive=root0,serial=ditana-test-root \
+        -drive file="$CONFIG_DRIVE",format=raw,if=none,id=config0 \
+        -device virtio-blk-pci,drive=config0,serial=ditana-test-config \
+        -cdrom "$ISO" \
+        -boot d \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
+        -display none \
+        -serial "file:$LOG" \
+        -monitor "unix:$MONITOR,server,nowait" \
+        -no-reboot &
+qemu_pid=$!
+
+# The deadline is watched here rather than by `timeout` or a background sleep.
+# Both would put a second process between this script and QEMU, and a process
+# started from here inherits the maintenance lock's file descriptor: killing
+# the script then leaves that child holding the lock, and the next job waits
+# half an hour for a `sleep` nobody can see. It has happened once already.
+timed_out=0
+deadline=$((SECONDS + TIMEOUT))
+while kill -0 "$qemu_pid" 2>/dev/null; do
+    # Asked before the deadline, because this is the answer the deadline would
+    # otherwise hide: the guest is not hanging, it has stopped on purpose and
+    # said why. Waiting out the timeout for that costs an hour and a half and
+    # reports the wrong thing.
+    if refusal=$(autoinstall_abort "$LOG"); then
+        screendump
+        kill "$qemu_pid" 2>/dev/null
+        wait "$qemu_pid" 2>/dev/null || true
+        die "The installer refused the answer file and stopped:"$'\n'"$refusal"
+    fi
+    if (( SECONDS >= deadline )); then
+        # While the guest is still there. Once it is killed, the one thing
+        # that could say why goes with it.
+        screendump
+        kill "$qemu_pid" 2>/dev/null
+        timed_out=1
+        break
+    fi
+    sleep 10
+done
+
+wait "$qemu_pid"
+qemu_status=$?
+set -e
+
+if (( timed_out )); then
+    die "The guest was still running after ${TIMEOUT}s. It never reached the reboot that ends an installation."
+fi
+[[ $qemu_status -eq 0 ]] || die "qemu exited with $qemu_status. See $LOG."
+
+record stage installed
+record install-seconds $((SECONDS - install_started))
+echo "The installation reached its final reboot. Booting what it installed."
+boot_started=$SECONDS
+
+# QEMU exiting is not the same as Ditana working: an installation can write
+# every file correctly and still produce a machine that does not come up. So
+# the disk is booted, with neither the medium nor the answer file attached,
+# and asked to say something for itself.
+#
+# What it has to say is an SSH banner. Nothing is injected into the guest to
+# arrange that -- install-openssh is on by default and enables sshd, so a
+# banner on port 22 is the installed system's own doing. Reaching it means the
+# bootloader ran, the initramfs found and imported the ZFS pool, systemd got
+# to multi-user, the network came up and a service started. No single check
+# available from outside covers more of an installation than that one.
+#
+# Logging in is neither possible nor needed: the banner is sent before
+# authentication, and it is the only thing being asked for.
+SSH_PORT=${DITANA_TEST_INSTALL_SSH_PORT:-2222}
+BOOT_TIMEOUT=${DITANA_TEST_INSTALL_BOOT_TIMEOUT:-600}
+BOOT_LOG=$WORK_DIR/qemu-boot.log
+
+set +e
+qemu-system-x86_64 \
+        -enable-kvm \
+        -machine q35 \
+        -cpu host \
+        -smp 2 \
+        -m "$MEMORY" \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+        -drive if=pflash,format=raw,file="$VARS" \
+        -drive file="$DISK",format=qcow2,if=none,id=root0 \
+        -device virtio-blk-pci,drive=root0,serial=ditana-test-root \
+        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" \
+        -device virtio-net-pci,netdev=net0 \
+        -display none \
+        -serial "file:$BOOT_LOG" \
+        -monitor "unix:$MONITOR,server,nowait" \
+        -no-reboot &
+boot_pid=$!
+set -e
+
+# --- BEGIN banner-probe ------------------------------------------------------
+# Lifted by bin/test-install-in-qemu-test, which cuts between BEGIN and END.
+#
+banner=""
+deadline=$((SECONDS + BOOT_TIMEOUT))
+while (( SECONDS < deadline )); do
+    kill -0 "$boot_pid" 2>/dev/null || break
+    # `read -t`, not `head -c`. head waits until it has all the bytes it was
+    # asked for; the banner is shorter than any round number worth asking
+    # for, so the timeout killed head before it printed anything and every
+    # attempt looked like silence. The guest had been answering from the
+    # first try -- its journal showed one "Connection closed by 10.0.2.2"
+    # for every probe -- and the run was reported as an installation that
+    # does not come up. A test that says that wrongly is worse than no test.
+    #
+    # A brace group around the exec, not `exec ... 2>/dev/null`. A bare exec
+    # applies its redirections to the shell itself, so the first probe that
+    # connected sent this script's own stderr to /dev/null for the rest of the
+    # run -- taking with it the die() below, whose message is the only thing
+    # the run record keeps about a failure, and the line naming the
+    # screenshot. The group's redirection ends with the group, and the refusals
+    # that a booting guest produces stay swallowed either way: they made every
+    # passing run look like a failing one.
+    if { exec 3<>"/dev/tcp/127.0.0.1/$SSH_PORT"; } 2>/dev/null; then
+        read -t 5 -r banner <&3 || banner=""
+        exec 3<&-
+    fi
+    [[ $banner == SSH-* ]] && break
+    banner=""
+    sleep 5
+done
+# --- END banner-probe --------------------------------------------------------
+
+if [[ -z $banner ]]; then
+    screendump
+    kill "$boot_pid" 2>/dev/null || true
+    wait "$boot_pid" 2>/dev/null || true
+    die "The installed system did not answer on port 22 within ${BOOT_TIMEOUT}s. It was installed, but it does not come up."
+fi
+
+kill "$boot_pid" 2>/dev/null || true
+wait "$boot_pid" 2>/dev/null || true
+
+record stage booted
+record boot-seconds $((SECONDS - boot_started))
+echo "The installed system booted and answered: ${banner%%$'\r'*}"
+echo "Disk: $DISK, install log: $LOG, boot log: $BOOT_LOG"

@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Entry point of the unattended daily build. ditana-package-build.service runs
+# this as root under the maintenance lock; its only job is to drop to the build
+# user and start the pipeline in the package tree.
+#
+# The pipeline must not run as root. It works in the build user's git clones,
+# signs with that user's GPG key and reaches the servers with that user's SSH
+# key; running it as root would change the ownership of everything it touches
+# and make the workstation fallback stop working. The two commands that do need
+# root -- arch-nspawn and makechrootpkg -- escalate through
+# /etc/sudoers.d/50-ditana-build.
+
+set -euo pipefail
+
+BUILD_CONF=/etc/ditana/package-build.conf
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+PIPELINE=$HERE/build-ditana-packages
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+[[ -r $BUILD_CONF ]] || die "$BUILD_CONF is missing; run setup-buildroot on this host"
+# shellcheck source=/dev/null
+source "$BUILD_CONF"
+
+[[ -n ${BUILD_USER:-} ]]   || die "BUILD_USER is not set in $BUILD_CONF"
+[[ -n ${PACKAGES_DIR:-} ]] || die "PACKAGES_DIR is not set in $BUILD_CONF"
+[[ -d $PACKAGES_DIR ]]     || die "$PACKAGES_DIR does not exist"
+[[ -x $PIPELINE ]]         || die "$PIPELINE is missing"
+
+[[ $EUID -eq 0 ]] || die "must run as root; the service starts it with ExecStart=+"
+
+# Arguments are passed through to the pipeline, so the unit decides what kind
+# of run this host does. With none given the safe mode wins: --build-only holds
+# no key, signs nothing and publishes nothing, so a misconfigured unit cannot
+# publish by accident.
+#
+# --then-test-install is the exception, taken out here rather than passed on:
+# it says that after a clean build this host installs the result into a
+# virtual machine and records what happened. It belongs to the host and not to
+# the pipeline -- it needs /dev/kvm and an ISO, which the workstation running
+# the same pipeline by hand has no reason to have.
+#
+# Both steps operate within the one maintenance lock the unit already holds. A
+# second `maintenance-lock run` would release it in between, and half an
+# hour is sufficient for an automatic update to install a kernel and reboot
+# the machine underneath the test. That is not hypothetical: it happened to a
+# test run that was started outside the lock.
+#
+# --release-after-test is the second such flag, and it is why --release must not
+# be used together with it: --release lives inside the pipeline and therefore
+# runs before the test installation that is supposed to gate it. This one runs
+# after, reads the verdict the test wrote, and releases only on a passing one.
+# --- BEGIN argument-handling -------------------------------------------------
+# Lifted by bin/ditana-package-build-test, which cuts between BEGIN and END.
+#
+args=()
+run_test_install=n
+release_after_test=n
+for arg in "$@"; do
+    if [[ $arg == --then-test-install ]]; then
+        run_test_install=y
+    elif [[ $arg == --release-after-test ]]; then
+        release_after_test=y
+        run_test_install=y
+    elif [[ $arg == --release ]]; then
+        die "--release releases before the test installation; use --release-after-test"
+    else
+        args+=("$arg")
+    fi
+done
+
+# The default is --build-only so that a misconfigured unit cannot publish by
+# accident. It must not apply to --release-after-test, which asks for the
+# opposite: that run has to sign and upload to testing, or the test installs
+# whatever was published before it and the release that follows says nothing
+# about what was just built. The first run of the full chain did exactly that.
+if [[ ${#args[@]} -eq 0 && $release_after_test != y ]]; then
+    args=(--build-only)
+fi
+
+# The same contradiction, spelled out rather than resolved in some order.
+if [[ $release_after_test == y ]]; then
+    for arg in "${args[@]}"; do
+        [[ $arg == --build-only ]] &&
+            die "--build-only signs and uploads nothing, so the test installation would install the previous state and the release would mean nothing"
+    done
+fi
+# printf applies its format once even with nothing to format, so an empty list
+# would arrive at the pipeline as a single empty argument -- which stops it with
+# "unrecognized arguments:" and nothing after the colon. The list is empty
+# exactly when --release-after-test was asked for.
+quoted=""
+if (( ${#args[@]} )); then
+    printf -v quoted ' %q' "${args[@]}"
+fi
+# --- END argument-handling ---------------------------------------------------
+
+# Reading the log of a run: `journalctl -u ditana-package-build.service` shows
+# only the first few lines. /etc/pam.d/runuser-l includes system-login and thus
+# pam_systemd, which moves everything below into a session-NNN.scope of its own,
+# and journald then attributes it to that scope rather than to this unit. The
+# whole run is under the syslog identifier instead:
+#
+#     journalctl -t maintenance-lock --since '-1d'
+#
+# Dropping -l would keep the process in the unit's cgroup, but then HOME, PATH
+# and USER have to be constructed here, and makepkg's source cache is
+# configured relative to HOME.
+if [[ $run_test_install != y ]]; then
+    exec runuser -l "$BUILD_USER" -c \
+        "cd $(printf '%q' "$PACKAGES_DIR") && exec $(printf '%q' "$PIPELINE")$quoted"
+fi
+
+runuser -l "$BUILD_USER" -c \
+    "cd $(printf '%q' "$PACKAGES_DIR") && exec $(printf '%q' "$PIPELINE")$quoted"
+
+# Only after a build that finished. A run the review gate stopped, or one with
+# a package that would not build, has nothing worth installing -- and the
+# record already says so.
+TEST_INSTALL=$HERE/ditana-test-install
+[[ -x $TEST_INSTALL ]] || die "$TEST_INSTALL is missing"
+
+if [[ $release_after_test != y ]]; then
+    exec runuser -l "$BUILD_USER" -c \
+        "exec $(printf '%q' "$TEST_INSTALL") --packages $(printf '%q' "$PACKAGES_DIR")"
+fi
+
+runuser -l "$BUILD_USER" -c \
+    "exec $(printf '%q' "$TEST_INSTALL") --packages $(printf '%q' "$PACKAGES_DIR")"
+
+# The verdict the test just wrote decides this, not the exit status above: a
+# test that could not run at all leaves no verdict, and that is refused too.
+RELEASE=$HERE/release-after-test
+[[ -x $RELEASE ]] || die "$RELEASE is missing"
+
+exec runuser -l "$BUILD_USER" -c \
+    "exec $(printf '%q' "$RELEASE") --packages $(printf '%q' "$PACKAGES_DIR")"

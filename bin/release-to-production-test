@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# What release-to-production.sh does to a document root, against a local one.
+#
+# The script reaches its servers with `ssh HOST bash` and a script on stdin, so
+# a program named ssh that runs that script here tests the real thing: the
+# same text, the same rsync, the same symlink dance -- only the transport is
+# local, and the transport is the one part with nothing to decide.
+#
+# The case worth having a test for is the one that was missing: a run that
+# rebuilt nothing used to copy the whole repository into a new directory,
+# move the symlink and delete the tree that was current, every single night.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT=$HERE/../libexec/release-to-production.sh
+[[ -x $SCRIPT ]] || { echo "FAIL: $SCRIPT is missing"; exit 1; }
+
+WORK=$(mktemp -d) || { echo "FAIL: no temporary directory"; exit 1; }
+trap 'rm -rf "$WORK"' EXIT
+
+pass=0; fail=0
+ok() { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no() { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+is() { if [[ "$2" == "$3" ]]; then ok "$1"; else printf '  FAIL %s\n    expected: %s\n    got:      %s\n' "$1" "$3" "$2"; fail=$((fail+1)); fi }
+
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+# `ssh HOST bash` with the script on stdin. The host is where it would run;
+# here it runs in this shell, which is the only difference.
+exec bash
+EOF
+chmod +x "$WORK/bin/ssh"
+export PATH=$WORK/bin:$PATH
+
+root=$WORK/www
+conf=$WORK/package-build.conf
+export DITANA_BUILD_CONF=$conf
+printf 'DITANA_SERVERS="root@example.invalid:%s"\n' "$root" > "$conf"
+
+#| A document root in the shape the servers have: testing, versions/, and
+#| `ditana` a symlink into versions/.
+fixture() {   # $1: extra file in testing, or empty for an identical pair
+    rm -rf "$root"
+    mkdir -p "$root/ditana-testing" "$root/versions"
+    printf 'package one\n' > "$root/ditana-testing/one.pkg.tar.zst"
+    printf 'db\n'          > "$root/ditana-testing/ditana.db.tar.gz"
+    live=$root/versions/ditana.live0001
+    # cp -a, so the pair really is identical down to the modification times --
+    # which is what rsync compares, and therefore what the check compares.
+    cp -a "$root/ditana-testing" "$live"
+    ln -sfn "$live" "$root/ditana"
+    if [[ -n ${1:-} ]]; then
+        printf 'package two\n' > "$root/ditana-testing/$1"
+    fi
+}
+
+live_target() { readlink -f "$root/ditana"; }
+versions()    { find "$root/versions" -maxdepth 1 -mindepth 1 | wc -l; }
+
+echo "when testing holds something production does not:"
+fixture two.pkg.tar.zst
+before=$(live_target)
+out=$("$SCRIPT" 2>&1); status=$?
+is "it succeeds"                    "$status" "0"
+[[ $(live_target) != "$before" ]] && ok "the symlink points somewhere new" \
+                                  || no "the symlink points somewhere new"
+[[ -f $(live_target)/two.pkg.tar.zst ]] && ok "and the new package is there" \
+                                        || no "and the new package is there"
+[[ ! -d $before ]] && ok "the directory that was current is gone" \
+                   || no "the directory that was current is gone"
+is "exactly one version directory is left" "$(versions)" "1"
+
+echo
+echo "when production already holds what testing holds:"
+fixture ""
+before=$(live_target)
+out=$("$SCRIPT" 2>&1); status=$?
+is "it succeeds"                 "$status" "0"
+is "the symlink is untouched"    "$(live_target)" "$before"
+is "no second version directory" "$(versions)" "1"
+grep -q "nothing to release" <<<"$out" && ok "and it says why it did nothing" \
+                                       || no "and it says why it did nothing ($out)"
+
+echo
+echo "what it refuses:"
+fixture ""
+rm -rf "$root/ditana"
+mkdir "$root/ditana"          # a directory where the symlink belongs
+"$SCRIPT" > "$WORK/out3" 2>&1
+is "a document root without the symlink stops it" "$?" "1"
+
+printf '# nothing here\n' > "$conf"
+"$SCRIPT" > "$WORK/out4" 2>&1
+is "an unconfigured server list stops it" "$?" "1"
+grep -q "DITANA_SERVERS" "$WORK/out4" && ok "and names the setting" \
+                                      || no "and names the setting"
+export DITANA_BUILD_CONF=$WORK/does-not-exist
+"$SCRIPT" > "$WORK/out5" 2>&1
+is "a missing configuration stops it" "$?" "1"
+
+echo
+echo "--- $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

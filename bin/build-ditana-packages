@@ -1,0 +1,1466 @@
+#!/usr/bin/env -S python -u
+# SPDX-License-Identifier: AGPL-3.0-or-later
+import collections
+import datetime
+import getpass
+import glob
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import argparse
+#from google.cloud import storage
+
+# The chroot the packages are built in. Its own pacman.conf carries the Ditana
+# repository, so the host's configuration is never touched -- see
+# build_in_chroot() for why that distinction is the point of the whole setup.
+# Created by bin/setup-buildroot.
+BUILDROOT = "/var/lib/ditana-buildroot"
+BUILDROOT_PACMAN_CONF = "/etc/ditana/pacman-buildroot.conf"
+# The chroot's own package cache, ahead of the host's. See add_to_local_repo().
+BUILDROOT_CACHE = "/var/cache/ditana-buildroot"
+
+# Where a finished package is staged so that the packages built after it can
+# depend on it. Inside the package tree, because the artefacts are hardlinked
+# into it and a hardlink cannot cross a filesystem boundary.
+LOCAL_REPO = os.path.abspath(".repo")
+REPO_DB = os.path.join(LOCAL_REPO, "ditana.db.tar.gz")
+
+# The key that signs the packages and the repository database. The trailing "!"
+# means this key and no other.
+#
+# It is not decoration. gpg answers a primary key or a user id with the newest
+# signing-capable subkey it can find, so the moment a signing subkey exists on
+# a build host, every signature switches over to it -- before the ditana-keyring
+# carrying that subkey has reached a single installation, and every installation
+# would then reject every Ditana package. The "!" makes the changeover a
+# decision instead of a side effect: it happens by editing this line, and only
+# after the new keyring has had its grace period.
+SIGNING_KEY = "068EEA2A490B0C63AEAA3BCD3EC223A811077C09!"
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REVIEW_GATE = os.path.join(HERE, "pkgbuild-review-gate")
+SRCDEST_PREFLIGHT = os.path.join(HERE, "makepkg-srcdest-preflight")
+# The maintenance contract routes every message via one entry point, so that the
+# transport is set up once in maintenance.conf and the host name is prefixed
+# consistently. Calling a transport directly from here would constitute a second
+# implementation of that.
+DITANA_NOTIFY = "/usr/bin/ditana-notify"
+# Beside the package tree, not beside the script: a run record describes a run
+# of this tree, and the script is reached through a symlink whose target
+# os.path.abspath does not resolve -- so keying it to the script put the
+# records in a different place depending on how the pipeline was invoked.
+RUN_RECORDS = os.path.abspath("build-runs")
+# makechrootpkg passes --log to makepkg, so every rebuilt package leaves
+# prepare/build/check/package logs in its directory. They are collected here
+# per run and published: a build that nobody can read is a claim, not evidence.
+# The volume is small -- a full Rust build logs about 50 KB, because the noise
+# a build writes to the terminal is not what makepkg records.
+RUN_LOGS = os.path.join(RUN_RECORDS, "logs")
+RUN_HISTORY = 90  # runs kept in the rolling index
+BUILD_HISTORY_TARGET = "/build-history/"
+
+
+class RunAborted(Exception):
+    """A condition that must stop the run before anything is published."""
+
+
+class RunRecord:
+    """Machine-readable record of one run, for the public build dashboard.
+
+    The dashboard exists to make one claim checkable: either every package is
+    current, or nothing shipped. So the record always states what happened to
+    every package, and whether the repository was published or held back --
+    a run that ends in an abort is as much a result as one that ends in a
+    release, and is written out either way.
+    """
+
+    # Everything that would leak infrastructure detail into a public file.
+    SCRUB = [
+        (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<server>"),
+        # The package tree, which is not necessarily below the home directory
+        # and therefore is not covered by the next rule. The gate quotes the
+        # command that would accept a change, and that command names it.
+        (re.compile(re.escape(os.getcwd())), "<packages>"),
+        (re.compile(re.escape(os.path.expanduser("~"))), "<home>"),
+        (re.compile(r"\broot@\S+"), "<server>"),
+        (re.compile(r"/var/www/\S+"), "<webroot>"),
+        # The bare login name, which survives the <home> substitution whenever
+        # it appears outside a path.
+        (re.compile(r"\b" + re.escape(getpass.getuser()) + r"\b"), "<user>"),
+    ]
+
+    def __init__(self):
+        self.started = datetime.datetime.now(datetime.timezone.utc)
+        self.packages = []
+        self.outcome = "incomplete"
+        self.message = ""
+        self.log_files = {}
+
+    @property
+    def stem(self):
+        return self.started.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+    def capture_logs(self, pkg_name, pkg_dir):
+        """Collect what makepkg logged for one package. Never raises.
+
+        Called after a build whether it succeeded or not -- the log of a build
+        that failed is the one somebody actually wants to read, and the run is
+        about to stop.
+        """
+        try:
+            sources = sorted(glob.glob(os.path.join(pkg_dir, "*.log")))
+            if not sources:
+                return
+            dest = os.path.join(RUN_LOGS, self.stem, pkg_name)
+            os.makedirs(dest, exist_ok=True)
+            # Every level, not just the last one. Ditana's umask is 027, so
+            # makedirs leaves each directory it creates at 0750, rsync carries
+            # that to the server, and the web server cannot traverse a
+            # directory it may not read -- every log below it is then a 404
+            # while the record still links to it. The same reason the run
+            # records themselves are chmod'ed in write().
+            for level in (RUN_LOGS, os.path.join(RUN_LOGS, self.stem), dest):
+                os.chmod(level, 0o755)
+            published = []
+            for source in sources:
+                name = os.path.basename(source)
+                with open(source, errors="replace") as fh:
+                    text = self.scrub(fh.read())
+                target = os.path.join(dest, name)
+                with open(target, "w") as fh:
+                    fh.write(text)
+                os.chmod(target, 0o644)
+                published.append(f"logs/{self.stem}/{pkg_name}/{name}")
+            self.log_files[pkg_name] = published
+        except Exception as e:
+            print(f"(could not collect logs for {pkg_name}: {e})")
+
+    def prune_logs(self, keep_stems):
+        """Drop the logs of runs that have fallen out of the rolling index."""
+        try:
+            for stem in os.listdir(RUN_LOGS):
+                if stem not in keep_stems:
+                    shutil.rmtree(os.path.join(RUN_LOGS, stem), ignore_errors=True)
+        except FileNotFoundError:
+            pass
+
+    @classmethod
+    def scrub(cls, text):
+        for pattern, replacement in cls.SCRUB:
+            text = pattern.sub(replacement, text)
+        return text
+
+    def package(self, name, status, detail="", seconds=None):
+        """status: rebuilt | current | review-stopped | build-failed"""
+        self.packages.append({
+            "name": name,
+            "status": status,
+            "detail": self.scrub(detail)[:2000],
+            "seconds": round(seconds, 1) if seconds is not None else None,
+            "logs": self.log_files.get(name, []),
+        })
+
+    def finish(self, outcome, message=""):
+        """One ordered progression, plus the state a stopped run ends in.
+
+            held-back   stopped; nothing reached any repository
+            built       every package built, nothing signed yet. This is where
+                        a keyless build host ends: whether the result reaches
+                        users is decided by a separate step on the machine that
+                        can sign
+            in-testing  signed and published to the testing repository
+            released    live in the production repository -- what users get
+
+        A single field, because these are stages of one journey and not
+        independent facts. It replaced an "outcome" plus a "promoted" boolean,
+        a pair in which the second was invisible on the dashboard and the first
+        used "published" for a state that had reached testing and nobody else.
+        """
+        self.outcome = outcome
+        self.message = self.scrub(message)
+
+    def as_dict(self):
+        finished = datetime.datetime.now(datetime.timezone.utc)
+        return {
+            "started": self.started.isoformat(timespec="seconds"),
+            "finished": finished.isoformat(timespec="seconds"),
+            "seconds": round((finished - self.started).total_seconds(), 1),
+            "outcome": self.outcome,
+            "message": self.message,
+            "counts": {
+                status: sum(1 for p in self.packages if p["status"] == status)
+                for status in ("rebuilt", "current", "review-stopped", "build-failed")
+            },
+            "packages": self.packages,
+        }
+
+    def write(self, directory):
+        """Write this run and refresh the rolling index. Never raises."""
+        try:
+            os.makedirs(directory, exist_ok=True)
+            name = self.stem + ".json"
+            path = os.path.join(directory, name)
+            with open(path, "w") as fh:
+                json.dump(self.as_dict(), fh, indent=1)
+            # Ditana's default umask is 027, and rsync preserves the mode, so
+            # without this the web server could not read its own build history.
+            # The same reason the package artefacts are chmod'ed below.
+            os.chmod(path, 0o644)
+
+            runs = sorted(f for f in os.listdir(directory)
+                          if f.endswith(".json") and f != "index.json")
+            kept = runs[-RUN_HISTORY:]
+            self.prune_logs({os.path.splitext(f)[0] for f in kept})
+            index = []
+            for run in kept:
+                with open(os.path.join(directory, run)) as fh:
+                    d = json.load(fh)
+                index.append({k: d[k] for k in
+                              ("started", "finished", "seconds", "outcome",
+                               "counts")} | {"file": run})
+            index_path = os.path.join(directory, "index.json")
+            with open(index_path, "w") as fh:
+                json.dump({"runs": list(reversed(index))}, fh, indent=1)
+            os.chmod(index_path, 0o644)
+            return name
+        except Exception as e:
+            print(f"(could not write run record: {e})")
+            return None
+
+
+def notify(title, body):
+    """Best-effort notification. Never raises: the abort matters more.
+
+    ditana-notify falls back to the journal when no transport is configured,
+    so a half-finished setup loses no information. On a workstation that has
+    no maintenance tooling installed the message stays on stdout, which is
+    where an interactive run is being watched anyway.
+    """
+    if not os.path.exists(DITANA_NOTIFY):
+        print(f"--- {title}: {body}")
+        return
+    try:
+        subprocess.run([DITANA_NOTIFY, title, body[:1500]],
+                       timeout=60, capture_output=True)
+    except Exception as e:
+        print(f"(notification failed: {e}) --- {title}: {body}")
+
+
+def release_to_production():
+    """Copy the testing repository over the production one.
+
+    This is what "released" means: the repository users install from is
+    replaced with what testing holds, and the directory it replaced is deleted.
+
+    Only ever called after a completely clean run: every package built, every
+    review gate passed, every upload succeeded. Ditana's claim is that its
+    packages are always mutually consistent, and releasing a half-finished run
+    would be exactly the breach that claim rules out.
+
+    The script lives in libexec/ rather than bin/ because calling it directly
+    releases without recording that it happened -- the run record is stamped by
+    the caller, and there is no caller then.
+    """
+    script = os.path.join(HERE, "..", "libexec", "release-to-production.sh")
+    script = os.path.normpath(script)
+    if not os.path.exists(script):
+        raise RunAborted(f"{script} is missing; cannot release")
+    print("--- Releasing testing to production...")
+    result = subprocess.run([script], capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode != 0:
+        # The run itself was fine, so testing is consistent and the packages
+        # are published there; only production is behind.
+        return (f"testing is published and consistent, but the release to "
+                f"production failed:\n{result.stderr.strip()}")
+    return None
+
+
+def srcdest_preflight():
+    """Catch stale VCS caches before hours of building are wasted on them."""
+    if not os.path.exists(SRCDEST_PREFLIGHT):
+        raise RunAborted(f"{SRCDEST_PREFLIGHT} is missing")
+    print("--- Checking the shared source cache...")
+    result = subprocess.run([SRCDEST_PREFLIGHT], capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode != 0:
+        raise RunAborted("stale cached clones in SRCDEST:\n" + result.stdout.strip())
+
+
+def review_pull(pkg_root):
+    """Let a human see any change that is not safe by construction.
+
+    Ditana signs these PKGBUILDs and its users trust the result via SigLevel, so
+    an unreviewed upstream commit would be shipped with Ditana's signature on it.
+    A finding stops the whole run, per the all-or-nothing invariant.
+    """
+    if not os.path.exists(REVIEW_GATE):
+        raise RunAborted(f"{REVIEW_GATE} is missing")
+    result = subprocess.run([REVIEW_GATE, pkg_root], capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode == 0:
+        return
+    raise RunAborted(
+        f"the PKGBUILD review gate stopped {os.path.basename(pkg_root)}:\n"
+        + (result.stdout + result.stderr).strip()
+        + waiting_behind(pkg_root)
+    )
+
+
+def gate_stops_besides(pkg_root):
+    """Which other packages the gate is already holding, newest state, no pull.
+
+    The run stops at the first package the gate objects to, in the order the
+    three-digit prefixes impose. Everything after it is never even looked at
+    that night -- so a second objection stays invisible until the first is
+    accepted, and a third until the second is. They accumulate silently.
+
+    That is not a thought experiment. Between 2026-08-25 and 2026-09-08 three
+    piled up (001-zfs-autosnap, 001-nvidia-470xx-utils, 001-niri-settings-git),
+    and each newly stopped package pushed itself in front of the older ones
+    because it sorts earlier. Fifteen nights reported one name and never the
+    other two.
+
+    Read-only on purpose: this asks the gate about working trees as they
+    already are and pulls nothing. A package this run has not reached tonight
+    is therefore reported only if an earlier run had already pulled it -- which
+    is exactly the accumulation case. Anything else would mean fetching from
+    every remote just to write a better message.
+    """
+    if not os.path.exists(REVIEW_GATE):
+        return []
+    stopped = []
+    for other in sorted_subdirs(os.path.dirname(os.path.abspath(pkg_root)) or "."):
+        if os.path.abspath(other) == os.path.abspath(pkg_root):
+            continue
+        try:
+            probe = subprocess.run([REVIEW_GATE, other],
+                                   capture_output=True, text=True, timeout=120)
+        except Exception:
+            continue
+        if probe.returncode != 0:
+            stopped.append(os.path.basename(other))
+    return stopped
+
+
+def waiting_behind(pkg_root):
+    """The part of the abort message that names what else is waiting.
+
+    >>> waiting_behind.render([])
+    ''
+    >>> print(waiting_behind.render(['001-b']))
+    <BLANKLINE>
+    <BLANKLINE>
+    One more package is already waiting for the same decision:
+      001-b
+    Accepting only the one above will stop the next run at it.
+    >>> print(waiting_behind.render(['001-b', '001-c']))
+    <BLANKLINE>
+    <BLANKLINE>
+    2 more packages are already waiting for the same decision:
+      001-b
+      001-c
+    Accepting only the one above will stop the next run at the first of them.
+    """
+    return waiting_behind.render(gate_stops_besides(pkg_root))
+
+
+def _render_waiting(names):
+    if not names:
+        return ""
+    if len(names) == 1:
+        head = "One more package is already waiting for the same decision:"
+        tail = "Accepting only the one above will stop the next run at it."
+    else:
+        head = f"{len(names)} more packages are already waiting for the same decision:"
+        tail = ("Accepting only the one above will stop the next run at the "
+                "first of them.")
+    return "\n\n" + head + "\n" + "\n".join(f"  {n}" for n in names) + "\n" + tail
+
+
+waiting_behind.render = _render_waiting
+
+def update_buildroot():
+    """Bring the clean chroot up to date, once per run.
+
+    Every package is then built in a snapshot of this state, so the whole
+    repository is built against one system state rather than against whatever
+    happened to be current when its turn came.
+
+    -C also refreshes the chroot's own copy of the configuration. mkarchroot
+    bakes that copy in at creation time, and makechrootpkg reads the copy, not
+    the file below -- so without this a chroot created for one package tree
+    would go on building against another tree's staging repository, silently
+    and for as long as nobody looked inside the chroot.
+    """
+    root = os.path.join(BUILDROOT, "root")
+    if not os.path.isdir(root) or not os.path.exists(BUILDROOT_PACMAN_CONF):
+        raise RunAborted(
+            f"{root} or {BUILDROOT_PACMAN_CONF} is missing. Run setup-buildroot "
+            f"on this host before the first build.")
+    print("--- Updating the build chroot...")
+    result = subprocess.run(
+        ["sudo", "-n", "arch-nspawn", "-C", BUILDROOT_PACMAN_CONF, root,
+         "pacman", "-Syu", "--noconfirm"],
+        capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode != 0:
+        raise RunAborted("could not update the build chroot:\n"
+                         + (result.stdout + result.stderr).strip())
+
+
+def prepare_local_repo():
+    """Start the run with an empty staging repository.
+
+    The chroot resolves dependencies between Ditana's own packages through this
+    directory, so it must describe this run and nothing else. A package left
+    over from a previous run would let a build succeed against a version that
+    is not going to be published.
+    """
+    if os.path.exists(LOCAL_REPO):
+        shutil.rmtree(LOCAL_REPO)
+    os.makedirs(LOCAL_REPO)
+    # Ditana's default umask is 027; pacman inside the container reads this
+    # directory as root, but a mode that depends on the umask is a trap for the
+    # next person who mounts it somewhere else.
+    os.chmod(LOCAL_REPO, 0o755)
+    # pacman fails to synchronise a repository whose database file is missing,
+    # and the first package is built before anything has been added to it.
+    subprocess.run(["tar", "czf", REPO_DB, "--files-from", "/dev/null"],
+                   check=True)
+    os.symlink(os.path.basename(REPO_DB), os.path.join(LOCAL_REPO, "ditana.db"))
+
+
+def add_to_local_repo(zst_files, sign=True):
+    """Make a finished package visible to the builds that follow it.
+
+    This replaces the `sudo pacman -Syu` the pipeline used to run on the host
+    between package groups: nothing is installed on the build machine any more,
+    the packages are only offered to the next chroot.
+
+    Every package goes in here, not only the rebuilt ones. The numeric prefixes
+    of the package directories are a build order, and the dependencies they
+    encode are not confined to the group boundaries: 001-wf-msg-git needs
+    001-wayfire-plugins-extra, 002-wayland-font-dpi needs
+    001-wayland-display-info. The staging repository is the only Ditana
+    repository the chroot can see, so a package that is merely current still
+    has to be offered from here -- otherwise everything downstream of it fails
+    to resolve its dependencies.
+
+    sign=False is for a build host that holds no key. Its staging repository is
+    unsigned, which is why the chroot does not demand a signature there; see
+    etc/pacman-buildroot.conf.in.
+
+    A package that keeps its version across a rebuild -- which is exactly what
+    a toolchain rebuild is -- comes out as a different file under the name it
+    had before. pacman copies even a file:// package into its cache, so a copy
+    from an earlier build would still be lying there, and pacman would reject
+    it against the new checksum and fail the whole transaction. Dropping the
+    name from the chroot's cache here is the only place that knows the file has
+    just been replaced.
+    """
+    staged = []
+    for zst in zst_files:
+        for src in (zst, zst + ".sig"):
+            if not os.path.exists(src):
+                # No .sig on a build-only host. The package itself is missing
+                # only if a caller passed a path that was never built.
+                if src == zst:
+                    raise FileNotFoundError(src)
+                continue
+            dst = os.path.join(LOCAL_REPO, os.path.basename(src))
+            if os.path.exists(dst):
+                os.remove(dst)
+            cached = os.path.join(BUILDROOT_CACHE, os.path.basename(src))
+            if os.path.exists(cached):
+                os.remove(cached)
+            try:
+                os.link(src, dst)
+            except OSError:
+                # Only reachable if the staging directory ended up on a
+                # different filesystem than the package tree.
+                shutil.copy2(src, dst)
+        staged.append(os.path.join(LOCAL_REPO, os.path.basename(zst)))
+
+    sign_args = ["--sign", "--key", SIGNING_KEY] if sign else []
+    subprocess.run(["repo-add"] + sign_args + [REPO_DB] + staged, check=True)
+
+
+GENERATED_FILES = ("PKGBUILD", ".SRCINFO")
+VERSION_LINE = re.compile(r"^[-+](?:pkgver|pkgrel)=")
+
+
+def revert_pipeline_edits(pkg_dir):
+    """Undo what this pipeline's own tools wrote into the clone, before pulling.
+
+    Two files are rewritten in place on every run. makepkg updates pkgver= in
+    the PKGBUILD of a VCS package whenever it computes the version -- that is
+    what refresh_vcs_pkgver() asks it to do -- and resets pkgrel= to 1 along
+    with it. .SRCINFO is regenerated from the PKGBUILD before each build.
+    `git clean -xfdf` removes untracked files but never reverts a tracked one,
+    so those edits accumulate for the lifetime of the clone. They are invisible
+    until upstream touches the same file, and then `git pull` refuses with
+    "Your local changes would be overwritten by merge" and the run stops.
+
+    Anything else that is modified is not ours. Four of these clones are
+    packages maintained in the AUR from this tree, so an uncommitted edit can be
+    work that exists nowhere else; discarding it silently to get a pull through
+    would be the worst possible trade. The PKGBUILD is therefore only restored
+    when its diff consists of nothing but the two version lines.
+    """
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=pkg_dir,
+                            capture_output=True, text=True, check=True)
+    root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=pkg_dir,
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+    restore, foreign = [], []
+    for line in status.stdout.splitlines():
+        code, path = line[:2], line[3:]
+        if code == "??":
+            continue                      # git clean's job, not this one
+        if code != " M" or os.path.basename(path) not in GENERATED_FILES:
+            foreign.append(line)
+        elif os.path.basename(path) == "PKGBUILD" and not only_version_lines(root, path):
+            foreign.append(line)
+        else:
+            restore.append(path)
+
+    if foreign:
+        raise RunAborted(
+            f"{pkg_dir} has local changes this pipeline did not make:\n  "
+            + "\n  ".join(foreign)
+            + "\nCommit or discard them; the run will not throw them away.")
+
+    if restore:
+        subprocess.run(["git", "checkout", "--"] + restore, cwd=root, check=True)
+
+
+def only_version_lines(root, path):
+    """True if a PKGBUILD differs from HEAD in pkgver=/pkgrel= and nothing else."""
+    diff = subprocess.run(["git", "diff", "-U0", "--", path], cwd=root,
+                          capture_output=True, text=True, check=True).stdout
+    for line in diff.splitlines():
+        if line.startswith(("+++", "---", "@@", "diff ", "index ")):
+            continue
+        if line.startswith(("+", "-")) and not VERSION_LINE.match(line):
+            return False
+    return True
+
+
+def refresh_vcs_pkgver(pkg_dir, quiet=False):
+    """Run pkgver() on the host, and as little else as possible.
+
+    -o alone would also run prepare(), and a prepare() that configures a build
+    needs the makedepends -- auracle runs meson in its own, which stops at a
+    missing pod2man. Those dependencies are installed in the chroot and nowhere
+    else, which is the entire point of building in one, so prepare() is skipped
+    here. makepkg runs pkgver() independently of it, and aurutils offers the
+    same flag for the same reason.
+
+    The residual assumption is that no pkgver() reads something prepare() would
+    have produced. Such a package would report the version of its previous
+    commit; the chroot build itself is unaffected.
+
+    -d because the dependency check belongs in the chroot as well.
+    """
+    subprocess.run(["makepkg", "-od", "--noprepare", "--noconfirm"],
+                   cwd=pkg_dir, check=True,
+                   stdout=subprocess.DEVNULL if quiet else None,
+                   stderr=subprocess.DEVNULL if quiet else None)
+
+
+#| Characters that a git ref may contain and a pkgver must not.
+#
+# git check-ref-format forbids only space, ~, ^, :, ?, *, [, backslash, .. and
+# @{ -- everything below is a legal tag name. What makes them dangerous is what
+# happens to a pkgver afterwards, not what they mean to git.
+DANGEROUS_IN_REF = "$`();&|<>{}!\"'\n\r\t"
+
+
+def dangerous_ref_names(names):
+    """The ref names that must not be allowed to become a pkgver.
+
+    A -git package whose pkgver() derives from `git describe --tags` turns an
+    upstream ref name into the package version. makepkg then writes that value
+    verbatim into the PKGBUILD and re-sources it -- update_pkgver() in
+    /usr/bin/makepkg says so itself: "Re-sources the PKGBUILD afterwards" --
+    and check_pkgver only rejects empty, whitespace, "/", ":", "-" and
+    non-ASCII. It passes $ ( ) ` ; & | { } through untouched.
+
+    So a tag called 1.0$(...) is shell, executed by the pipeline. And
+    refresh_vcs_pkgver runs makepkg on the *host*, outside the chroot, as the
+    build user -- the one place where nothing else is contained.
+
+    Four packages reach pkgver through tag names today (niri-git,
+    niri-settings-git, wezterm-git, xdg-terminal-exec-git), so this is not a
+    hypothetical shape.
+
+    >>> dangerous_ref_names(["v1.2.3", "26.09", "release_2026"])
+    []
+    >>> dangerous_ref_names(["1.0$(id)"])
+    ['1.0$(id)']
+    >>> dangerous_ref_names(["v1.0", "a`whoami`b", "c;d"])
+    ['a`whoami`b', 'c;d']
+
+    The peeled form ls-remote prints for an annotated tag is not a ref name and
+    is filtered out before this sees it -- but if it ever arrives here it must
+    still be recognised as unfit for a version, which it is:
+
+    >>> dangerous_ref_names(["refs/tags/v1.0^{}"])
+    ['refs/tags/v1.0^{}']
+    """
+    return [n for n in names if any(c in DANGEROUS_IN_REF for c in n)]
+
+
+def git_sources_of(pkg_dir):
+    """The git URLs a package fetches, read out of .SRCINFO.
+
+    .SRCINFO and not the PKGBUILD: reading the PKGBUILD would mean either
+    sourcing it -- the one thing the review gate refuses to do, for the same
+    reason -- or parsing shell. The pipeline regenerates .SRCINFO from the
+    PKGBUILD before each build, so it is current.
+
+    >>> git_sources_of.parse(["pkgbase = x", "\tsource = git+https://e/r.git"])
+    ['https://e/r.git']
+    >>> git_sources_of.parse(["\tsource = git+https://e/r.git#branch=main"])
+    ['https://e/r.git']
+    >>> git_sources_of.parse(["\tsource = local.patch", "\tsource = https://e/t.tar.gz"])
+    []
+    >>> git_sources_of.parse(["\tsource = name::git+https://e/r.git"])
+    ['https://e/r.git']
+    """
+    path = os.path.join(pkg_dir, ".SRCINFO")
+    if not os.path.exists(path):
+        return []
+    with open(path, errors="replace") as fh:
+        return git_sources_of.parse(fh.read().splitlines())
+
+
+def _parse_git_sources(lines):
+    urls = []
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != "source":
+            continue
+        value = value.strip()
+        # makepkg allows "filename::url"; the fragment after # selects a branch
+        # or tag and is not part of the URL.
+        if "::" in value:
+            value = value.split("::", 1)[1]
+        if not value.startswith("git+"):
+            continue
+        urls.append(value[len("git+"):].split("#", 1)[0])
+    return urls
+
+
+git_sources_of.parse = _parse_git_sources
+
+
+def reject_dangerous_refs(pkg_dir):
+    """Stop the run if an upstream ref name could become shell.
+
+    Asked over the network with ls-remote rather than of a local clone,
+    because the clone does not exist yet on a host that has never built this
+    package -- and because this has to happen before makepkg fetches anything
+    and runs pkgver().
+
+    A remote that cannot be reached is not silently passed over: the run stops
+    here rather than at makepkg, where the same failure would read as a
+    different problem.
+    """
+    for url in git_sources_of(pkg_dir):
+        probe = subprocess.run(["git", "ls-remote", "--tags", "--heads", url],
+                               capture_output=True, text=True, timeout=180)
+        if probe.returncode != 0:
+            raise RunAborted(
+                f"could not list the refs of {url} for "
+                f"{os.path.basename(pkg_dir)}:\n{probe.stderr.strip()}")
+        # ls-remote prints a second line per annotated tag, "refs/tags/x^{}",
+        # naming the object the tag points at. That is not a ref name, and it
+        # ends in characters this check rejects -- niri's tags made it fire on
+        # a remote that is perfectly fine.
+        names = [line.split("\t", 1)[1].strip()
+                 for line in probe.stdout.splitlines() if "\t" in line]
+        names = [n for n in names if not n.endswith("^{}")]
+        bad = dangerous_ref_names(names)
+        if bad:
+            raise RunAborted(
+                f"{os.path.basename(pkg_dir)}: {url} carries ref name(s) that "
+                f"must not become a package version: {', '.join(bad[:5])}\n"
+                f"A pkgver() built from `git describe --tags` would put this "
+                f"into the PKGBUILD, which makepkg re-sources as shell -- on "
+                f"this host, outside the chroot. Nothing is built from this "
+                f"remote until somebody has looked at it.")
+
+
+def prepare_sources(pkg_dir, is_vcs):
+    """Fetch and verify the sources on the host, before the chroot build.
+
+    makechrootpkg calls makepkg with --skipinteg and --holdver, and neither can
+    be switched off from the outside, so both have to be compensated for here.
+
+    Without the verification step no checksum and no source signature in any
+    PKGBUILD would ever be checked again -- and the review gate's rule that a
+    checksum may only change together with a version is worth nothing if the
+    checksum itself is never verified.
+
+    Without running pkgver() first, --holdver would build a VCS package under
+    the previous commit's version and publish it under that name.
+
+    This is the step most likely to stop a run for a reason outside the
+    pipeline -- a checksum that no longer matches, a source that has moved, an
+    upstream signing key the build host does not have -- so it reports what
+    makepkg said rather than only that makepkg failed.
+    """
+    if is_vcs:
+        reject_dangerous_refs(pkg_dir)
+        refresh_vcs_pkgver(pkg_dir)
+    else:
+        run_reporting_output(["makepkg", "--verifysource", "--noconfirm"], pkg_dir,
+                             f"the sources of {os.path.basename(pkg_dir)} "
+                             f"could not be fetched or verified")
+
+
+def run_reporting_output(command, cwd, what):
+    """Run a command, stream its output, and put that output in the abort.
+
+    check=True raises a CalledProcessError whose message is the argv and an
+    exit status, which is what a notification then carries -- true and useless.
+    The reason is in the output, so it is streamed as it arrives (a source
+    download must stay watchable) and kept, and the tail of it goes into the
+    RunAborted that stops the run. From there it reaches the run record, the
+    dashboard and the message.
+    """
+    process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, errors="replace")
+    # Bounded: a full build writes tens of thousands of lines and only the end
+    # of it says why it stopped. makepkg prints its ERROR summary last, and the
+    # item that actually failed just before.
+    lines = collections.deque(maxlen=40)
+    for line in process.stdout:
+        print(line, end="")
+        lines.append(line)
+    if process.wait() != 0:
+        raise RunAborted(f"{what}:\n" + "".join(lines).strip())
+
+
+def build_in_chroot(pkg_dir):
+    """Build one package in a snapshot of the clean chroot.
+
+    -c starts from a fresh copy of the chroot root, -u lets that copy pick up
+    what this run has already staged, which is what makes 002-* build against
+    001-*.
+
+    The host's own pacman.conf is deliberately not involved. Pointing it at the
+    testing repository for the duration of a build is a system-wide change with
+    no reliable undo: an OOM kill during a Rust link step -- realistic on 12 GB
+    -- would leave the machine pulling testing packages into the running system
+    at the next automatic update. The chroot removes that window instead of
+    shortening it.
+
+    A build that fails while compiling leaves a makepkg log, which the run
+    record links. One that fails before makepkg starts -- an unresolvable
+    dependency is the usual case -- leaves none at all, and then the tail
+    collected here is the only evidence there is.
+    """
+    run_reporting_output(
+        ["sudo", "-n", "makechrootpkg", "-c", "-u", "-r", BUILDROOT,
+         "--", "-f", "--noconfirm", "--needed"],
+        pkg_dir, f"{os.path.basename(pkg_dir)} did not build")
+
+
+# The same variable release-to-production.sh honours, so that a second
+# installation -- or a test -- points both halves at one file.
+BUILD_CONF = os.environ.get("DITANA_BUILD_CONF", "/etc/ditana/package-build.conf")
+
+
+def parse_build_conf(lines, key):
+    """One value out of the build configuration, which is shell.
+
+    Deliberately not a shell parser. It reads KEY=value, strips one layer of
+    quotes and ignores everything else -- a setting that needs more than that
+    belongs in the pipeline rather than in a file root sources. The last
+    assignment wins, as it would in the shell:
+
+        >>> parse_build_conf(['A=1', '# a comment', 'B="two words"'], "B")
+        'two words'
+        >>> parse_build_conf(['A=1'], "MISSING") is None
+        True
+        >>> parse_build_conf(['A=1', 'A=2'], "A")
+        '2'
+
+    A key is the whole name, so a longer one ending in it is not a match, and
+    a line without an assignment is not one either:
+
+        >>> parse_build_conf(['MY_A=1', '# A=2'], "A") is None
+        True
+
+    A quoted value may span lines, because the shell that sources this file
+    accepts one and a list of servers is exactly the setting somebody writes
+    that way. Reading only the first line of it produced an address with a
+    quotation mark stuck to the front, uploaded nowhere, and reported nothing
+    -- two readers of one file disagreeing, which is the failure this parser
+    exists to avoid:
+
+        >>> parse_build_conf(['S="one', 'two"'], "S")
+        'one\\ntwo'
+
+    An unterminated quote is refused rather than guessed at, for the same
+    reason:
+
+        >>> try:
+        ...     parse_build_conf(['S="one'], "S")
+        ... except RunAborted as refusal:
+        ...     print(refusal)
+        S in the build configuration opens a quote that is never closed.
+    """
+    value = None
+    lines = iter(lines)
+    for line in lines:
+        name, sep, rest = line.partition("=")
+        if not sep or name.strip() != key:
+            continue
+        rest = rest.strip()
+        if rest[:1] in ("\"", "'"):
+            quote, body = rest[0], rest[1:]
+            while not body.endswith(quote):
+                try:
+                    body += "\n" + next(lines).rstrip("\n")
+                except StopIteration:
+                    raise RunAborted(f"{key} in the build configuration opens "
+                                     f"a quote that is never closed.") from None
+            value = body[:-1]
+        else:
+            value = rest
+    return value
+
+
+def build_conf(key):
+    """Read one setting of this installation.
+
+    The file is shell, sourced by ditana-package-build before it drops to the
+    build user, and read here for the few settings that are a property of the
+    installation rather than of the software: which hosts this repository is
+    published to, and where they keep it. Those addresses sitting in the source
+    is the reason this repository could not be published as it stood.
+    """
+    try:
+        with open(BUILD_CONF) as fh:
+            return parse_build_conf(fh, key)
+    except FileNotFoundError:
+        return None
+
+
+def ditana_servers():
+    """Where the repository is published, as user@host:/document-root.
+
+    Fails closed and by name. An empty list would make copy_to_servers() a
+    no-op, and a run that publishes to nowhere and says nothing is the one
+    outcome the all-or-nothing rule must never produce.
+    """
+    configured = build_conf("DITANA_SERVERS")
+    if not configured:
+        raise RunAborted(
+            f"DITANA_SERVERS is not set in {BUILD_CONF}. It names the hosts "
+            f"this repository is published to, as a space-separated list of "
+            f"user@host:/document-root.")
+    return configured.split()
+
+
+def copy_to_servers(src_files, dst_path):
+    if not dst_path.startswith('/') or not dst_path.endswith('/'):
+        raise ValueError("Target directory must begin and end with '/'.")
+
+    for server in ditana_servers():
+        server_address, server_dir = server.split(':')
+        server_dir += dst_path
+
+        print(f"Creating directory on {server_address}:{server_dir}")
+        subprocess.run(["ssh", server_address, f"mkdir -p {server_dir}"], check=True)
+
+        print(f"Syncing files to {server_address}:{server_dir}")
+        rsync_cmd = [
+            "rsync",
+            "-avz",  # archive mode, verbose, compress
+            "--checksum",  # use checksums for comparison
+            "--no-owner",  # don't try to set ownership
+            "--no-group",  # don't try to set group
+            *src_files,  # expand the list of source files
+            f"{server_address}:{server_dir}"
+        ]
+        subprocess.run(rsync_cmd, check=True)
+
+
+def clean_testing_directory(testing_path):
+    """Clean the testing directory on all servers before uploading new packages."""
+    for server in ditana_servers():
+        server_address, server_dir = server.split(':')
+        full_testing_dir = server_dir + testing_path
+
+        print(f"Cleaning testing directory on {server_address}:{full_testing_dir}")
+
+        # Use find to safely remove only files (not directories)
+        cleanup_cmd = f"find {full_testing_dir} -maxdepth 1 -type f -delete"
+        subprocess.run(["ssh", server_address, cleanup_cmd], check=True)
+
+        # Verify the directory is empty of files
+        verify_cmd = f"find {full_testing_dir} -maxdepth 1 -type f | wc -l"
+        result = subprocess.run(["ssh", server_address, verify_cmd],
+                              capture_output=True, text=True, check=True)
+        file_count = int(result.stdout.strip())
+
+        if file_count == 0:
+            print(f"✓ Testing directory cleaned successfully on {server_address}")
+        else:
+            raise Exception(f"Failed to clean testing directory on {server_address}, {file_count} files remain")
+
+
+def copy_to_gcs(src_files, dst_path):
+    gcs_bucket_name = "ditana"
+
+    if not dst_path.startswith('/') or not dst_path.endswith('/'):
+        raise ValueError("Target directory must begin and end with '/'.")
+
+    for src_file in src_files:
+        print(f"Copying {src_file} to Google Cloud Storage at {gcs_bucket_name}{dst_path}/")
+        upload_to_gcs(src_file, gcs_bucket_name, dst_path)
+
+
+def upload_to_gcs(src_file, bucket_name, dst_path):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    full_path = os.path.join(dst_path, os.path.basename(src_file))
+
+    if full_path.startswith('/'):
+        full_path = full_path[1:]
+
+    blob = bucket.blob(full_path)
+    blob.upload_from_filename(src_file)
+
+    print(f"Uploaded {src_file} to {bucket_name}/{full_path}")
+
+
+def gpg_sign_file(file_path):
+    """Sign one artifact with SIGNING_KEY -- with that key, not with a user id.
+
+    A user id would let gpg choose, and what it chooses changes the day a
+    signing subkey appears. The repository database is signed through
+    repo-add's --key from the same constant, so both signatures always come
+    from the same key.
+
+    The signature is then checked back against the *pacman* keyring, which is
+    the keyring a user has, rather than against the signer's own. That is the
+    only way this pipeline can notice it has produced a package nobody can
+    install -- and it matters most during a keyring changeover, when the key
+    that signs and the key that has been shipped are not yet the same. The
+    check used to sit in the build chroot, as SigLevel on the staging
+    repository; it was moved here because it only ever covered the packages
+    some later package happened to depend on, and because a build host that
+    holds no key cannot satisfy it at all.
+    """
+    print(f"Signing {file_path} with GPG")
+    subprocess.run([
+        "gpg", "--verbose", "--local-user", SIGNING_KEY,
+        "--detach-sign", "--use-agent", file_path
+    ], check=True)
+    verify_against_pacman_keyring(file_path)
+
+
+def verify_against_pacman_keyring(file_path):
+    """Check one artifact's signature the way a user's pacman would."""
+    result = subprocess.run(["pacman-key", "--verify", f"{file_path}.sig", file_path],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RunAborted(
+            f"{os.path.basename(file_path)} was signed, but its signature does "
+            f"not verify against this host's pacman keyring. A user could not "
+            f"install this package.\n{result.stdout}{result.stderr}")
+
+
+def repo_files():
+    """The repository database and its signature, as pacman expects them."""
+    return [f for f in glob.glob(os.path.join(LOCAL_REPO, "ditana.*"))
+            if not f.endswith(".old") and not f.endswith(".old.sig")]
+
+
+PACKAGE_DIR = re.compile(r"^\d{3}-")
+
+
+def sorted_subdirs(top):
+    """The package directories, in build order.
+
+    The three-digit prefix is not decoration: it is the order in which the
+    packages have to be built, because a package in one group is a dependency
+    of packages in the groups after it, and within a group the alphabetical
+    order does the same job (001-wayfire-plugins-extra before 001-wf-msg-git).
+
+    Requiring the prefix rather than taking every directory keeps anything else
+    in the tree -- this pipeline's own build-runs/, a scratch clone, a
+    half-finished package -- out of that order instead of sorting it into some
+    arbitrary position and searching it for a PKGBUILD.
+    """
+    return sorted(
+        os.path.join(top, d) for d in os.listdir(top)
+        if PACKAGE_DIR.match(d) and os.path.isdir(os.path.join(top, d))
+    )
+
+def find_pkgbuild(directory):
+    pkgbuild_paths = []
+    for root, _, files in os.walk(directory):
+        if 'PKGBUILD' in files:
+            pkgbuild_path = os.path.join(root, 'PKGBUILD')
+            # Berechne den relativen Pfad vom Basis-Verzeichnis
+            rel_path = os.path.relpath(pkgbuild_path, directory)
+            try:
+                print(f"------------ Checking {rel_path} in {directory}")
+                subprocess.run(
+                    ['git', 'ls-files', '--error-unmatch', rel_path],
+                    cwd=directory,
+                    check=True,
+                    capture_output=True
+                )
+                pkgbuild_paths.append(pkgbuild_path)
+            except subprocess.CalledProcessError:
+                print(f"------------ ERROR for {rel_path} in {directory}")
+                continue
+
+    if len(pkgbuild_paths) == 0:
+        print(f"------------ None in {directory}")
+        return None
+    elif len(pkgbuild_paths) > 1:
+        raise ValueError(f"Multiple PKGBUILD files found in {directory}")
+    else:
+        print(f"------------ Single in {directory}")
+        return pkgbuild_paths[0]
+
+def execute_pre_build_hook(pkg_dir):
+    pkg_dir = os.path.abspath(pkg_dir)
+    pre_build_hook = os.path.join(pkg_dir, "pre-build-hook")
+
+    print(f"Current working directory: {os.getcwd()}")
+    print(f"pkg_dir (absolute): {pkg_dir}")
+    print(f"pre_build_hook path: {pre_build_hook}")
+
+    if os.path.exists(pre_build_hook):
+        print("pre-build-hook exists")
+        if os.access(pre_build_hook, os.X_OK):
+            print("pre-build-hook is executable")
+            print("--- Executing pre-build hook...")
+            try:
+                result = subprocess.run([pre_build_hook], cwd=pkg_dir, check=True, capture_output=True, text=True)
+                print(f"pre-build hook output:\n{result.stdout}")
+            except subprocess.CalledProcessError as e:
+                print(f"Error executing pre-build hook: {e}")
+                print(f"Error output:\n{e.output}")
+                raise
+        else:
+            print("pre-build-hook is not executable")
+    else:
+        print("pre-build-hook does not exist")
+
+def get_current_gcc_major():
+    """Return the major version of the currently installed GCC."""
+    result = subprocess.run(["gcc", "-dumpversion"], capture_output=True, text=True, check=True)
+    return result.stdout.strip().split('.')[0]
+
+
+def get_build_gcc_major(zst_file):
+    """Extract the GCC major version used to build a package from its .BUILDINFO."""
+    try:
+        result = subprocess.run(
+            ["bsdtar", "-xOf", zst_file, ".BUILDINFO"],
+            capture_output=True, text=True, check=True
+        )
+        for line in result.stdout.splitlines():
+            # .BUILDINFO contains lines like "installed = gcc-15.2.1-1"
+            if line.startswith("installed = gcc-"):
+                return line.split("gcc-")[1].split('.')[0]
+    except subprocess.CalledProcessError:
+        pass
+    return None
+
+
+def files_compiled_into(pkg_root):
+    """The repository paths this package builds from, as the review gate sees them.
+
+    Asked of the gate rather than worked out here. It is the one place that
+    knows how to tell a packaged file from a README without sourcing the
+    PKGBUILD, and two answers to that question would drift apart.
+    """
+    if not os.path.exists(REVIEW_GATE):
+        return []
+    result = subprocess.run([REVIEW_GATE, pkg_root, "--list-local-sources"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def package_reference_time(pkg_root, pkgbuild_path, dirpath):
+    """The moment this package last changed, taken from git rather than the disk.
+
+    A modification time says when a file was last written, not when it last
+    changed, and the two part company here in both directions.
+
+    makepkg writes the computed pkgver= into the PKGBUILD of a VCS package while
+    it builds. The next run reverts that edit before any timestamp is read, the
+    revert is a write, and the file is suddenly newer than the artefact nobody
+    touched -- so the package rebuilt on every run once it had been built once,
+    and the check that asks whether upstream moved at all was never reached. The
+    other way round, a change to a packaged file that is not the PKGBUILD moved
+    nothing at all, so editing a mirror list would have been accepted at the
+    review gate and then not built.
+
+    The commit time answers both, and comes from the history where this
+    pipeline's own edits cannot reach it. A fresh clone carries the upstream
+    time, so a seeded artefact is correctly current, which is what
+    set-clone-mtimes was working around.
+
+    Only the files that reach makepkg count. Measured on the build host: taking
+    any commit at all would have rebuilt xfce-wallpaper-overlay because somebody
+    edited .github/FUNDING.yml, while leaving xfce-display-config-observer
+    stale, which is the one of the two that really did change.
+
+    The mtime fallback should be unreachable, every package directory being a
+    clone with a PKGBUILD. It is still better than a package that silently never
+    rebuilds again.
+    """
+    paths = files_compiled_into(pkg_root)
+    if paths:
+        result = subprocess.run(["git", "log", "-1", "--format=%ct", "--"] + paths,
+                                cwd=pkg_root, capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip().isdigit():
+            return int(result.stdout.strip())
+
+    print(f"--- No commit time for {pkg_root}, falling back to file times")
+    pyproject_path = os.path.join(dirpath, "pyproject.toml")
+    pyproject_mtime = os.path.getmtime(pyproject_path) if os.path.exists(pyproject_path) else 0
+    return max(os.path.getmtime(pkgbuild_path), pyproject_mtime)
+
+
+def artefacts_are_current(artefacts, reference_time, require_signature):
+    """Whether what was built still matches what the package says it is.
+
+    Each artefact is given as (modification time, whether a .sig sits beside it).
+
+    A signature is part of being current only where this run would produce one.
+    On a build-only host the artefacts are unsigned by design, and demanding a
+    .sig here would rebuild every package every single night.
+
+    >>> artefacts_are_current([(200, False)], 100, False)
+    True
+    >>> artefacts_are_current([(50, False)], 100, False)
+    False
+
+    An artefact of exactly the reference time is not current: a build that
+    finished in the same second as the commit it was made from is the one case
+    where guessing wrong costs nothing but a rebuild.
+
+    >>> artefacts_are_current([(100, False)], 100, False)
+    False
+
+    Every artefact has to be current, not merely one of them, because a split
+    package that produced only some of its outputs is not built.
+
+    >>> artefacts_are_current([(200, True), (50, True)], 100, True)
+    False
+
+    Where signatures are required, an unsigned artefact is not current -- and
+    where they are not, its absence says nothing.
+
+    >>> artefacts_are_current([(200, False)], 100, True)
+    False
+    >>> artefacts_are_current([(200, True)], 100, True)
+    True
+
+    Nothing built is never current, whatever the times say.
+
+    >>> artefacts_are_current([], 100, False)
+    False
+    """
+    if not artefacts:
+        return False
+    return all(
+        (signed or not require_signature) and mtime > reference_time
+        for mtime, signed in artefacts
+    )
+
+
+def needs_toolchain_rebuild(pkg_name, zst_files):
+    """Check if a package needs rebuilding due to a GCC major version change.
+
+    This is critical for kernel packages: DKMS modules are compiled at install
+    time using the system GCC, but validated against the compiler version
+    recorded in the kernel headers. A major version mismatch (e.g. GCC 15 vs
+    16) causes configure checks in modules like zfs-dkms to fail, even though
+    the kernel config is correct."""
+    if not zst_files:
+        return False
+
+    # Only check packages where compiler compatibility matters. Kernel packages
+    # are the primary case; extend the list if other native-code packages in
+    # the Ditana repo are affected.
+    toolchain_sensitive_prefixes = ("linux-",)
+    base_name = pkg_name.lstrip("0123456789-")
+    if not any(base_name.startswith(p) for p in toolchain_sensitive_prefixes):
+        return False
+
+    current_gcc_major = get_current_gcc_major()
+    newest_zst = max(zst_files, key=os.path.getmtime)
+    build_gcc_major = get_build_gcc_major(newest_zst)
+
+    if build_gcc_major and build_gcc_major != current_gcc_major:
+        print(f"--- Toolchain change detected for {pkg_name}: "
+              f"built with GCC {build_gcc_major}, system has GCC {current_gcc_major}. "
+              f"Forcing rebuild.")
+        return True
+
+    return False
+
+def main():
+    parser = argparse.ArgumentParser(description='Build and upload Ditana packages')
+    parser.add_argument('--skip-upload', action='store_true',
+                       help='Skip uploading files if they were not rebuilt')
+    parser.add_argument('--skip-review-gate', action='store_true',
+                       help='Do not review what git pull brought in. Only for a '
+                            'run whose diffs you have already read.')
+    parser.add_argument('--release', action='store_true',
+                       help='After a clean run, release testing to production')
+    parser.add_argument('--build-only', action='store_true',
+                       help='Build, but do not sign, publish or release. For a '
+                            'build host that holds no signing key; a separate '
+                            'publish step signs the result elsewhere.')
+    args = parser.parse_args()
+
+    if args.build_only:
+        # Nothing here signs, so the machine needs no key at all. That is the
+        # point of the mode: the build host is the machine that compiles
+        # unreviewed upstream code, and it should not be the machine that can
+        # vouch for the result.
+        args.skip_upload = True
+    else:
+        subprocess.run(["gpg", "--list-keys"], check=True)
+
+    rebuilt = []
+    run = RunRecord()
+
+    def record_and_upload():
+        """Publish the run record whatever the outcome -- a held-back run is
+        exactly the case the dashboard has to show."""
+        run.write(RUN_RECORDS)
+        if not args.skip_upload:
+            try:
+                sources = [os.path.join(RUN_RECORDS, f) for f in os.listdir(RUN_RECORDS)
+                           if f.endswith(".json")]
+                if os.path.isdir(RUN_LOGS):
+                    sources.append(RUN_LOGS)   # rsync -a recurses into it
+                copy_to_servers(sources, BUILD_HISTORY_TARGET)
+            except Exception as e:
+                print(f"(could not upload build history: {e})")
+
+    try:
+        srcdest_preflight()
+        # Before updating the chroot, so that it never synchronises a Ditana
+        # repository still describing the previous run.
+        prepare_local_repo()
+        if args.build_only:
+            print("--- Build-only run: nothing will be signed or published.")
+        update_buildroot()
+        target = "/ditana-testing/x86_64/"
+
+        if not args.skip_upload:
+            print("Cleaning testing directories...")
+            clean_testing_directory(target)
+
+        for dirpath in sorted_subdirs("."):
+            print(f"Entering {dirpath}")
+            pkgbuild_path = find_pkgbuild(dirpath)
+            if pkgbuild_path:
+                pkg_dir = os.path.dirname(pkgbuild_path)
+                pkg_name = os.path.basename(dirpath)
+                pkg_started = time.monotonic()
+
+                zst_files = [f for f in glob.glob(os.path.join(pkg_dir, "*.pkg.tar.zst")) if "-debug" not in f]
+
+                revert_pipeline_edits(pkg_dir)
+                subprocess.run(["git", "pull"], cwd=pkg_dir, check=True)
+                if not args.skip_review_gate:
+                    try:
+                        review_pull(dirpath)
+                    except RunAborted as e:
+                        run.package(pkg_name, "review-stopped", str(e),
+                                    time.monotonic() - pkg_started)
+                        raise
+
+                should_process = True
+                if len(zst_files) > 0:
+                    reference_time = package_reference_time(dirpath, pkgbuild_path, dirpath)
+                    all_packages_up_to_date = artefacts_are_current(
+                        [(os.path.getmtime(z), os.path.exists(z + ".sig")) for z in zst_files],
+                        reference_time,
+                        require_signature=not args.build_only,
+                    )
+
+                    if all_packages_up_to_date:
+                        if needs_toolchain_rebuild(pkg_name, zst_files):
+                            should_process = True
+                        elif pkg_name.endswith(("-git", "-svn", "-hg")):
+                            print(f"--- Checking upstream version for VCS package {pkg_name}...")
+                            try:
+                                refresh_vcs_pkgver(pkg_dir, quiet=True)
+
+                                # --packagelist prints the absolute paths this
+                                # PKGBUILD would produce, at the version that
+                                # was just computed.
+                                result = subprocess.run(["makepkg", "--packagelist"],
+                                    cwd=pkg_dir,
+                                    capture_output=True,
+                                    text=True,
+                                    check=True
+                                )
+                                # Without the -debug filter this branch was
+                                # unconditionally true for every package that
+                                # produces nothing to strip -- an any-arch
+                                # shell or Python package is listed with a
+                                # -debug companion that is never written, so
+                                # "the expected files exist" was never
+                                # satisfied and the package was rebuilt every
+                                # single run under the message that upstream
+                                # had moved. The rest of the pipeline filters
+                                # the same way.
+                                expected_files = [
+                                    line.strip() for line in result.stdout.strip().split('\n')
+                                    if line.strip() and "-debug" not in os.path.basename(line)
+                                ]
+
+                                # Has the exact file for the new version already been built?
+                                if expected_files and all(os.path.exists(f) for f in expected_files):
+                                    print(f"--- Upstream unchanged. Skipping build of {pkg_name}.")
+                                    should_process = False
+                                else:
+                                    print(f"--- New upstream commit detected! Building {pkg_name}...")
+                                    should_process = True
+
+                            except subprocess.CalledProcessError:
+                                print(f"--- Error checking VCS version for {pkg_name}. Forcing build.")
+                                should_process = True
+                        else:
+                            print(f"--- Skipping build of {pkg_name}, all packages are up to date.")
+                            should_process = False
+
+                if should_process:
+                    print(f"--- Processing {pkg_name}...")
+                    rebuilt.append(pkg_name)
+
+                    subprocess.run(["git", "clean", "-xfdf"], cwd=pkg_dir, check=True)
+                    # Before --printsrcinfo, because the hook stages the files
+                    # the PKGBUILD refers to and .SRCINFO is derived from a
+                    # PKGBUILD that can be read. git clean has just removed
+                    # whatever the previous run staged.
+                    execute_pre_build_hook(pkg_dir)
+                    subprocess.run(["makepkg", "--printsrcinfo"], cwd=pkg_dir, stdout=open(os.path.join(pkg_dir, ".SRCINFO"), 'w'), check=True)
+
+                    # A package that fails has to leave the same trace as one
+                    # that succeeds. Without this it was never recorded at all
+                    # -- the exception propagated straight out of the loop --
+                    # so the dashboard's "build failed" column could not become
+                    # non-zero, and the logs of the one build anybody would
+                    # want to read were not collected. Fetching the sources is
+                    # inside this, because a source that cannot be verified is
+                    # a package that did not build, and the record should say
+                    # which package it was.
+                    try:
+                        prepare_sources(pkg_dir, pkg_name.endswith(("-git", "-svn", "-hg")))
+                        build_in_chroot(pkg_dir)
+                    except Exception as e:
+                        run.capture_logs(pkg_name, pkg_dir)
+                        # A RunAborted already reads as a sentence; anything
+                        # else needs its type to be identifiable at all.
+                        detail = str(e) if isinstance(e, RunAborted) else f"{type(e).__name__}: {e}"
+                        run.package(pkg_name, "build-failed", detail,
+                                    time.monotonic() - pkg_started)
+                        raise
+                    run.capture_logs(pkg_name, pkg_dir)
+
+                    zst_files = [f for f in glob.glob(os.path.join(pkg_dir, "*.pkg.tar.zst")) if "-debug" not in f]
+
+                    if not zst_files:
+                        raise FileNotFoundError(f"No .pkg.tar.zst files found in {pkg_dir}.")
+
+                    for zf in zst_files:
+                        os.chmod(zf, 0o644)
+                        if not args.build_only:
+                            gpg_sign_file(zf)
+                            os.chmod(f"{zf}.sig", 0o644)
+
+                # --skip-upload only suppresses re-uploading a package that was
+                # not rebuilt, so it does not cover a build-only host on its
+                # own: a rebuilt package would still be sent. That host has no
+                # key, produces no .sig and cannot reach the publish servers at
+                # all -- collecting the artefacts is the publish step's job.
+                if not args.build_only and (should_process or not args.skip_upload):
+                    files_to_copy = zst_files + [f"{zf}.sig" for zf in zst_files]
+                    copy_to_servers(files_to_copy, target)
+
+                # Unconditionally: the numeric prefixes are a build order, and
+                # a package that was not rebuilt is still a dependency of the
+                # ones that follow it. Skipping this on a build-only host left
+                # the chroot with an empty Ditana repository, and every package
+                # that depends on another Ditana package failed to resolve.
+                add_to_local_repo(zst_files, sign=not args.build_only)
+
+                run.package(pkg_name, "rebuilt" if should_process else "current",
+                            seconds=time.monotonic() - pkg_started)
+
+        if not args.build_only:
+            print("Copying main files...")
+            copy_to_servers(repo_files(), target)
+
+    except RunAborted as e:
+        # Nothing has been released, so the production repository is untouched
+        # and still consistent. That is the point of stopping here.
+        print(f"Run aborted: {e}")
+        run.finish("held-back", str(e))
+        record_and_upload()
+        notify("Ditana build stopped", str(e))
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}")
+        run.finish("held-back", f"{type(e).__name__}: {e}")
+        record_and_upload()
+        notify("Ditana build failed", f"{type(e).__name__}: {e}")
+        sys.exit(1)
+
+    # The release happens only on this path: every package built, every gate
+    # passed, every upload succeeded. Any failure above left via sys.exit and
+    # never reaches here, so a partial repository cannot be released.
+    released = False
+    if args.release and not args.skip_upload and not args.build_only:
+        failure = release_to_production()
+        if failure:
+            print(failure)
+            run.finish("in-testing", failure)   # testing did ship; production lags
+            record_and_upload()
+            notify("Ditana release failed", failure)
+            sys.exit(1)
+        released = True
+
+    summary = (f"{len(rebuilt)} package(s) rebuilt: {', '.join(rebuilt)}"
+               if rebuilt else "no package needed rebuilding")
+    run.finish("built" if args.build_only else
+               ("released" if released else "in-testing"), summary)
+    record_and_upload()
+    print(f"--- Done. {summary}")
+    if rebuilt:
+        # A daily "nothing happened" push would train the eye to ignore these,
+        # and the one that matters is the abort.
+        notify("Ditana build succeeded", summary)
+
+if __name__ == "__main__":
+    main()

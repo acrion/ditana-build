@@ -1,0 +1,44 @@
+[Unit]
+Description=Build the Ditana package repository and publish it
+Documentation=https://github.com/acrion/ditana-build
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# '+' runs this with full privileges: the pipeline drops to the build user by
+# itself, and the two steps that do need root escalate through
+# /etc/sudoers.d/50-ditana-build.
+#
+# --release-after-test is the whole chain in one flag: build, sign with the
+# subkey, upload to testing, install that testing repository into a local QEMU
+# guest, and release to production only if the installation worked. All of it in
+# one invocation, so that a host arbitrating against its own system updates can
+# put the whole chain inside a single lock -- see the drop-in beside this file.
+#
+# It replaced --build-only --then-test-install, which was the arrangement from
+# the time this host held no key. That pair looked like a test loop and was
+# not one: --build-only signs and uploads nothing, so the guest installed
+# whatever was in the testing repository from some earlier day, and its verdict
+# described a state that had nothing to do with the run that had just built.
+#
+# The host therefore needs the signing subkey, an SSH key both publish servers
+# accept, /dev/kvm and an ISO in ~/ditana-installer/out. On a host without
+# them, --build-only is the flag to put here, and the signing happens elsewhere.
+ExecStart=+/usr/local/bin/ditana-package-build --release-after-test
+
+# Python block-buffers stdout when it is not a terminal, so the pipeline's own
+# progress reaches the journal in one lump at the end -- or not at all -- while
+# the output of every subprocess it starts is written through immediately. The
+# journal of a failed unattended run then shows the git output of a package
+# without the line naming which package it was.
+Environment=PYTHONUNBUFFERED=1
+
+# Type=oneshot disables the start timeout by default (systemd.service(5)). On
+# the automatic system update of this host, that default once let a single
+# interactive pacman prompt stall the whole update automation for two months
+# without any error being reported. The value sets a ceiling for a wedged run,
+# not a target: a cold build of every package takes the better part of a day on
+# two cores.
+TimeoutStartSec=20h

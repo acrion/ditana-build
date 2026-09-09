@@ -1,0 +1,421 @@
+#!/usr/bin/env -S python -u
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Sign and publish what a build host produced.
+
+The build host compiles third-party PKGBUILDs and therefore runs code nobody
+has read; it must not be the machine that can vouch for the result. So it
+builds with `build-ditana-packages --build-only` and holds no key at all, and
+this runs where the key is.
+
+What that does and does not buy is worth stating plainly: the key never reaches
+the build host, and nobody there can have arbitrary data signed. It does not
+make the packages themselves more trustworthy -- this signs what the build host
+produced, sight unseen.
+
+    publish-ditana-build [--from user@host] [--staging DIR]
+                         [--release | --release-only] [--untested]
+
+A bare run stops at the testing repository. Releasing from there needs the
+build host to have installed that repository into a virtual machine and said
+that it worked; without such a verdict the release refuses, and --untested is
+the way to say that a release is wanted anyway. --release-only finishes the
+job after a bare run; --release does both in one go and is the form for an
+unattended host.
+
+Either way the run record is told how far its packages got. The build host
+writes 'built' and can honestly write no more -- it holds no key and reaches no
+server -- so everything that becomes true afterwards has to be written where it
+becomes true, which is here.
+
+Everything happens in the staging directory, deliberately outside the local
+package tree: that tree is an independent second build host, and mixing another
+machine's artefacts into it would destroy the only property that makes builds
+reproducible here.
+"""
+import argparse
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PIPELINE = os.path.join(HERE, "build-ditana-packages")
+
+DEFAULT_STAGING = os.path.expanduser("~/ditana-publish")
+TARGET = "/ditana-testing/x86_64/"
+
+
+def load_pipeline():
+    """Reuse the pipeline's own signing, staging and upload steps.
+
+    A second implementation of any of them would be a second thing to keep
+    correct, and the interesting ones -- the all-or-nothing upload order and
+    the key pinning -- are exactly the ones that must not drift.
+    """
+    loader = importlib.machinery.SourceFileLoader("ditana_pipeline", PIPELINE)
+    spec = importlib.util.spec_from_loader("ditana_pipeline", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def fetch(build_host, remote_tree, staging):
+    """Bring over the artefacts and the build host's run records.
+
+    --delete removes an artefact the build host no longer has, so a version
+    that was replaced upstream cannot linger here and be published forever.
+    Signatures made on this machine are excluded from the filter and therefore
+    survive, which is what lets an unchanged package keep its signature. For the
+    same reason --delete-excluded must not be added: it would delete them.
+
+    Only the numbered package directories are descended into, the same rule the
+    pipeline's own loop follows. The tree also holds .repo/, the staging
+    repository, which contains a hardlink to every package that has been built
+    -- fetching that as well brought each artefact over twice, under two paths,
+    and every one of them was then signed twice and uploaded twice.
+    """
+    artefacts = os.path.join(staging, "artefacts")
+    os.makedirs(artefacts, exist_ok=True)
+    print(f"--- Fetching artefacts from {build_host}")
+    subprocess.run([
+        "rsync", "-a", "--delete", "--prune-empty-dirs",
+        "-f", "+ /[0-9][0-9][0-9]-*/", "-f", "- /*",
+        "-f", "+ */", "-f", "+ *.pkg.tar.zst", "-f", "- *",
+        f"{build_host}:{remote_tree}/", artefacts + "/",
+    ], check=True)
+
+    print(f"--- Fetching run records from {build_host}")
+    subprocess.run([
+        "rsync", "-a",
+        f"{build_host}:{remote_tree}/build-runs/", os.path.join(staging, "build-runs") + "/",
+    ], check=True)
+
+
+_pipeline = None
+
+
+def pipeline_module():
+    """The pipeline, loaded at most once per process.
+
+    Loading it executes the module, and two of the four call sites below reach
+    it from a script that has no other use for it.
+    """
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = load_pipeline()
+    return _pipeline
+
+
+def upload_records(staging):
+    """Copy the run records and the logs that belong to them to the servers."""
+    records = os.path.join(staging, "build-runs")
+    sources = [os.path.join(records, f) for f in os.listdir(records) if f.endswith(".json")]
+    logs = os.path.join(records, "logs")
+    if os.path.isdir(logs):
+        sources.append(logs)   # rsync -a recurses into it
+    pipeline = pipeline_module()
+    pipeline.copy_to_servers(sources, pipeline.BUILD_HISTORY_TARGET)
+
+
+def publish_run_record(staging, **fields):
+    """Record on the build host's run what happened to it, and publish that.
+
+    The build host writes 'built' and cannot honestly write more: it holds no
+    key and never sees a server. Everything that happens to its artefacts
+    afterwards is known where it happens and nowhere else, so it is written
+    there -- into the run's own file and into the rolling index the dashboard
+    reads, which both arrived from the build host saying 'built'.
+
+    Writing and uploading are one step because they were two, and the second
+    one was forgotten twice: once here, where the test installation wrote its
+    verdict with a stamp of its own, and once in release-after-test, which
+    stamped a release nobody could see. A record that stays on the machine that
+    wrote it has no reader -- the dashboard is on the servers -- so a stamp
+    without an upload is never the thing anyone wanted, and there is no longer
+    a way to spell it.
+
+    An upload that fails is reported and does not raise. By the time anything
+    is stamped the packages are already on the servers, and a run that
+    published a repository must not be turned into a failed one by a record
+    that could not follow it.
+    """
+    records = os.path.join(staging, "build-runs")
+    index_path = os.path.join(records, "index.json")
+    with open(index_path) as fh:
+        index = json.load(fh)
+    runs = index.get("runs", [])
+    if not runs:
+        return None
+
+    runs[0].update(fields)
+    with open(index_path, "w") as fh:
+        json.dump(index, fh, indent=1)
+    # Ditana's default umask is 027, and rsync preserves the mode, so without
+    # this the web server could not read its own build history.
+    os.chmod(index_path, 0o644)
+
+    run_path = os.path.join(records, runs[0]["file"])
+    with open(run_path) as fh:
+        record = json.load(fh)
+    record.update(fields)
+    with open(run_path, "w") as fh:
+        json.dump(record, fh, indent=1)
+    os.chmod(run_path, 0o644)
+
+    try:
+        upload_records(staging)
+    except Exception as e:
+        # Both, and not only the notification: notify() captures the output of
+        # ditana-notify, so on a host with no transport configured the message
+        # would exist nowhere at all. stdout is the journal of the unattended
+        # run and the terminal of an interactive one.
+        report = (f"the run record was stamped {fields} but not published: {e}")
+        print(f"--- {report}")
+        pipeline_module().notify("Ditana build history not published",
+                                 f"{runs[0]['file']}: {report}")
+    return runs[0]["file"]
+
+
+def test_install_verdict(staging):
+    """What the test installation said about this run, if it said anything.
+
+    The verdict is written on the build host, into the run's own record, so it
+    arrives here with the records that fetch() brings over. It has to be
+    written there rather than here: the test installs from the testing
+    repository on the machine that built it, and this machine learns of it
+    only through the record.
+    """
+    records = os.path.join(staging, "build-runs")
+    index_path = os.path.join(records, "index.json")
+    if not os.path.exists(index_path):
+        return None
+    with open(index_path) as fh:
+        runs = json.load(fh).get("runs", [])
+    if not runs:
+        return None
+    run_path = os.path.join(records, runs[0]["file"])
+    if not os.path.exists(run_path):
+        return None
+    with open(run_path) as fh:
+        return json.load(fh).get("test-install")
+
+
+def release_refusal(verdict, untested=False):
+    """Why this run must not be released, or None if it may be.
+
+    A repository that builds, signs and uploads can still be one nobody can
+    install from, and the release is the last point at which that can be
+    caught.
+
+    A verdict that says anything other than 'passed' refuses the release, and
+    no flag changes that -- there is nothing a flag could mean there except
+    "ship what was measured to be broken":
+
+        >>> release_refusal({"result": "failed", "detail": "no boot"})
+        'Not releasing: the test installation of this run failed. no boot'
+        >>> release_refusal({"result": "failed"}, untested=True)
+        'Not releasing: the test installation of this run failed.'
+
+    A missing verdict is a different case, and --untested is for it. The test
+    loop is younger than this check, so until the build host stamps every run
+    a release that is genuinely wanted has to be able to happen -- as
+    something somebody asked for, not as a fallback that lets an untested run
+    pass for a tested one:
+
+        >>> release_refusal(None) is None
+        False
+        >>> release_refusal(None, untested=True) is None
+        True
+        >>> release_refusal({"result": "passed"}) is None
+        True
+    """
+    if verdict is None:
+        if untested:
+            return None
+        return ("Not releasing: this run carries no test installation verdict. "
+                "The build host records one after it has installed the testing "
+                "repository into a virtual machine.\n"
+                "Pass --untested to release anyway, and say so to whoever asks "
+                "why production moved without a test.")
+    if verdict.get("result") != "passed":
+        return (f"Not releasing: the test installation of this run "
+                f"{verdict.get('result', 'did not pass')}. "
+                f"{verdict.get('detail', '')}".rstrip())
+    return None
+
+
+def release(pipeline, staging, untested=False):
+    """Replace production with what is in testing, and say so in the record."""
+    verdict = test_install_verdict(staging)
+    refusal = release_refusal(verdict, untested)
+    if refusal:
+        print(refusal)
+        sys.exit(1)
+    if verdict is None:
+        print("--- Releasing without a test installation verdict, as asked.")
+    else:
+        print(f"--- The test installation of this run passed "
+              f"({verdict.get('finished', 'time unknown')}).")
+
+    failure = pipeline.release_to_production()
+    if failure:
+        print(failure)
+        sys.exit(1)
+    publish_run_record(staging, outcome="released")
+    print("--- Released. This is now what users install.")
+
+
+def build_host_run_is_publishable(staging):
+    """Refuse to publish a run the build host itself stopped.
+
+    The build host aborts for a review-gate finding or a build error, and its
+    record says so. Publishing anyway would turn every control on that machine
+    into decoration.
+    """
+    index = os.path.join(staging, "build-runs", "index.json")
+    if not os.path.exists(index):
+        return "the build host has no run records; has it run yet?"
+    with open(index) as fh:
+        runs = json.load(fh).get("runs", [])
+    if not runs:
+        return "the build host's run index is empty"
+    latest = runs[0]
+    if latest["outcome"] != "built":
+        return (f"the build host's last run ({latest['started']}) ended as "
+                f"'{latest['outcome']}', not 'built'. Nothing to publish.")
+    if latest["counts"].get("build-failed") or latest["counts"].get("review-stopped"):
+        return f"the build host's last run reports {latest['counts']}"
+    return None
+
+
+def signature_is_current(pipeline, zst):
+    """A signature counts only if it belongs to this exact file.
+
+    A rebuild that keeps its version -- a toolchain rebuild does -- arrives
+    under the name it had before. Taking the old signature on trust because a
+    .sig happens to be there would publish a package whose signature does not
+    match it, which every user's pacman would then reject.
+    """
+    sig = zst + ".sig"
+    if not os.path.exists(sig):
+        return False
+    if os.path.getmtime(sig) < os.path.getmtime(zst):
+        return False
+    return subprocess.run(["gpg", "--verify", sig, zst],
+                          capture_output=True).returncode == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sign and publish what the build host produced")
+    # No default in the source: which machine builds is a property of the
+    # installation, so it comes from the build configuration -- BUILD_HOST in
+    # /etc/ditana/package-build.conf -- and --from overrides it for a one-off.
+    parser.add_argument("--from", dest="build_host", default=None,
+                        help="build host as user@host (default: BUILD_HOST "
+                             "from /etc/ditana/package-build.conf)")
+    parser.add_argument("--remote-tree", default="packages",
+                        help="package tree on the build host (default: packages)")
+    parser.add_argument("--staging", default=DEFAULT_STAGING,
+                        help=f"working directory (default: {DEFAULT_STAGING})")
+    # Opt-in, like --release in build-ditana-packages, and for a stronger
+    # reason here: releasing replaces the production repository and deletes
+    # what it replaced, so it is the one step with no way back. A bare
+    # invocation publishes to testing and stops.
+    what = parser.add_mutually_exclusive_group()
+    what.add_argument("--release", action="store_true",
+                      help="after publishing to testing, release it to "
+                           "production (irreversible; omit to stop at testing)")
+    what.add_argument("--release-only", action="store_true",
+                      help="release what is already in testing, without "
+                           "fetching, signing or uploading anything")
+    parser.add_argument("--untested", action="store_true",
+                        help="release a run that carries no test installation "
+                             "verdict (a failed one is refused regardless)")
+    args = parser.parse_args()
+
+    staging = os.path.abspath(args.staging)
+    os.makedirs(staging, exist_ok=True)
+
+    # The pipeline derives its staging repository from the working directory,
+    # so this has to happen before it is loaded.
+    os.chdir(staging)
+    pipeline = pipeline_module()
+
+    if args.release_only:
+        # The step after a manual test: testing already holds what was checked,
+        # so nothing is fetched and nothing is signed again. Deliberately no
+        # fetch -- it would overwrite the record this machine just stamped with
+        # the build host's copy, which still says 'built'.
+        if not os.path.exists(os.path.join(staging, "build-runs", "index.json")):
+            print(f"Nothing to release: {staging} holds no run records. "
+                  f"Run publish-ditana-build first.")
+            sys.exit(1)
+        release(pipeline, staging, args.untested)
+        return
+
+    build_host = args.build_host or pipeline.build_conf("BUILD_HOST")
+    if not build_host:
+        print(f"No build host: pass --from user@host, or set BUILD_HOST in "
+              f"{pipeline.BUILD_CONF}.")
+        sys.exit(1)
+
+    subprocess.run(["gpg", "--list-keys"], check=True)
+    fetch(build_host, args.remote_tree, staging)
+
+    refusal = build_host_run_is_publishable(staging)
+    if refusal:
+        print(f"Not publishing: {refusal}")
+        sys.exit(1)
+
+    artefacts = os.path.join(staging, "artefacts")
+    zst_files = [f for f in glob.glob(os.path.join(artefacts, "**", "*.pkg.tar.zst"),
+                                      recursive=True)
+                 if "-debug" not in os.path.basename(f)]
+    if not zst_files:
+        print("Not publishing: the build host produced no packages")
+        sys.exit(1)
+
+    signed = 0
+    for zst in sorted(zst_files):
+        os.chmod(zst, 0o644)
+        if signature_is_current(pipeline, zst):
+            continue
+        if os.path.exists(zst + ".sig"):
+            os.remove(zst + ".sig")
+        pipeline.gpg_sign_file(zst)
+        os.chmod(zst + ".sig", 0o644)
+        signed += 1
+    print(f"--- {signed} of {len(zst_files)} package(s) needed a signature")
+
+    pipeline.prepare_local_repo()
+    pipeline.add_to_local_repo(sorted(zst_files))
+
+    print("--- Cleaning the testing repository")
+    pipeline.clean_testing_directory(TARGET)
+    pipeline.copy_to_servers(
+        sorted(zst_files) + [z + ".sig" for z in sorted(zst_files)], TARGET)
+    pipeline.copy_to_servers(pipeline.repo_files(), TARGET)
+
+    # After the uploads succeeded and not before: the record must not claim a
+    # publication that a failure above would have prevented.
+    publish_run_record(staging, outcome="in-testing")
+
+    # Only here, on a path no failure above can reach: every package signed,
+    # every upload done. The same placement the pipeline uses, for the same
+    # reason -- a partially published repository must not be releasable.
+    if not args.release:
+        print(f"--- {len(zst_files)} package(s) published to testing. "
+              f"Production left alone.")
+        print("--- To release after testing it: publish-ditana-build --release-only")
+        return
+    release(pipeline, staging, args.untested)
+    print(f"--- Done. {len(zst_files)} package(s) released.")
+
+
+if __name__ == "__main__":
+    main()

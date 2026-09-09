@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# What the medium is checked for before a verdict is taken from it.
+#
+# The decisions are doctested beside the code. What cannot be written down as a
+# doctest is the reading: a rootfs image inside an ISO, reported by xorriso and
+# opened by unsquashfs at an offset. That is what this exercises, against media
+# it builds itself -- a few hundred kilobytes each, carrying the two files the
+# check reads and nothing else.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT=$HERE/ditana-test-install
+[[ -f $SCRIPT ]] || { echo "FAIL: $SCRIPT is missing"; exit 1; }
+
+for tool in mksquashfs xorriso unsquashfs; do
+    command -v "$tool" >/dev/null ||
+        { echo "skip: $tool is not installed, so no medium can be built here"; exit 0; }
+done
+
+WORK=$(mktemp -d) || { echo "FAIL: no temporary directory"; exit 1; }
+trap 'rm -rf "$WORK"' EXIT
+
+pass=0; fail=0
+ok() { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no() { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+is() {
+    if [[ "$2" == "$3" ]]; then printf '  ok   %s\n' "$1"; pass=$((pass+1))
+    else printf '  FAIL %s\n    expected: %s\n    got:      %s\n' "$1" "$3" "$2"; fail=$((fail+1)); fi
+}
+
+# A medium: $1 a name, $2 the mirrorlist its installer would include, $3 the
+# branch it was built from, $4 "signed" to put a rootfs signature beside the
+# image. An empty mirrorlist leaves enable-ditana.sh out altogether.
+medium() {
+    local name=$1 mirrorlist=$2 branch=$3 signed=${4:-}
+    local root=$WORK/$name-root iso=$WORK/$name-iso
+
+    mkdir -p "$root/root/bind-mount/root" "$iso/ditana/x86_64"
+    printf 'export DITANA_VERSION=0.9.4-Beta\n' > "$root/root/ditana-version.sh"
+    [[ -n $branch ]] &&
+        printf 'export DITANA_BRANCH=%s\n' "$branch" >> "$root/root/ditana-version.sh"
+    [[ -n $mirrorlist ]] &&
+        printf 'Include = /etc/pacman.d/%s\n' "$mirrorlist" \
+            > "$root/root/bind-mount/root/enable-ditana.sh"
+
+    mksquashfs "$root" "$iso/ditana/x86_64/airootfs.sfs" \
+        -noappend -quiet -no-progress >/dev/null 2>&1
+    [[ $signed == signed ]] && printf 'not a real signature\n' \
+        > "$iso/ditana/x86_64/airootfs.sfs.sig"
+    xorriso -as mkisofs -V "Ditana_$name" -o "$WORK/$name.iso" "$iso" >/dev/null 2>&1
+    printf '%s' "$WORK/$name.iso"
+}
+
+# The verdict on one medium, as the run itself would take it: the reasons, one
+# per line, or "unreadable: ..." where the ISO is not a medium at all.
+verdict() {
+    python - "$SCRIPT" "$1" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("t", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+try:
+    for reason in module.unfit_reasons(module.read_medium(sys.argv[2])):
+        print(reason)
+except ValueError as problem:
+    print(f"unreadable: {problem}")
+PY
+}
+
+echo "a medium built for this test:"
+iso=$(medium fit ditana-testing-mirrorlist main)
+is "nothing stands against it" "$(verdict "$iso")" ""
+
+echo
+echo "what it is refused for:"
+iso=$(medium signed ditana-testing-mirrorlist main signed)
+grep -q 'it is signed' <<<"$(verdict "$iso")" &&
+    ok "a signed medium is a published one, and is refused" ||
+    no "a signed medium is a published one, and is refused"
+
+iso=$(medium production ditana-mirrorlist main)
+grep -q 'already released' <<<"$(verdict "$iso")" &&
+    ok "one whose installer enables the production repository" ||
+    no "one whose installer enables the production repository"
+
+iso=$(medium branch ditana-testing-mirrorlist feature/serial-console)
+grep -q "branch 'feature/serial-console'" <<<"$(verdict "$iso")" &&
+    ok "one built from a branch, which carries that branch's configuration" ||
+    no "one built from a branch, which carries that branch's configuration"
+
+echo
+echo "and what it refuses rather than guesses:"
+iso=$(medium silent "" main)
+grep -q 'cannot be told' <<<"$(verdict "$iso")" &&
+    ok "a medium that names no mirrorlist at all" ||
+    no "a medium that names no mirrorlist at all"
+
+iso=$(medium nameless ditana-testing-mirrorlist "")
+grep -q 'which branch' <<<"$(verdict "$iso")" &&
+    ok "one that does not say what it was built from" ||
+    no "one that does not say what it was built from"
+
+mkdir -p "$WORK/empty/boot"
+printf 'nothing here\n' > "$WORK/empty/boot/README"
+xorriso -as mkisofs -V "NotAMedium" -o "$WORK/empty.iso" "$WORK/empty" >/dev/null 2>&1
+grep -q 'is not an installation medium' <<<"$(verdict "$WORK/empty.iso")" &&
+    ok "an ISO that is not an installation medium at all" ||
+    no "an ISO that is not an installation medium at all"
+
+echo
+echo "every one of them for its own reason, and not for another:"
+iso=$(medium three ditana-mirrorlist feature/x signed)
+is "three faults produce three reasons" "$(verdict "$iso" | wc -l)" "3"
+
+echo
+echo "--- $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

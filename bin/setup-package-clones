@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Recreate the package working tree of the Ditana repository on a fresh host.
+#
+# The 57 package directories are independent git clones with a remote layout
+# that until now existed only on Stefan's workstation, as accumulated knowledge.
+# That made a second build host unreproducible: the pipeline cannot be verified
+# anywhere else if nobody can recreate what it builds from.
+#
+# The layout is derived from two sources kept next to this script:
+#
+#   packages.tsv   directory, remote name and fetch URL for every clone
+#   this script    which AUR packages Stefan maintains himself and therefore
+#                  need an SSH push URL in addition to the HTTPS fetch URL
+#
+# The push URLs are expressed as a rule rather than recorded per clone, because
+# the rule is the actual fact: AUR fetches go over HTTPS because aurweb's SSH
+# endpoint is unavailable while the AUR is in maintenance mode, and pushing is
+# only ever needed where Stefan is the maintainer.
+#
+# Usage:
+#   setup-package-clones <target-directory> [--dry-run]
+
+set -euo pipefail
+
+# AUR packages maintained by Stefan. These keep an SSH push URL so that
+# uploading a package update still works once the AUR re-enables pushes.
+MAINTAINED_AUR_PACKAGES=(
+    nexuslua
+    zelph
+    wayland-display-info
+    wdisplays-persistent
+    wdisplays
+)
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+manifest="$here/packages.tsv"
+
+target=${1-}
+dry_run=0
+[[ ${2-} == --dry-run ]] && dry_run=1
+
+if [[ -z $target ]]; then
+    echo "usage: ${0##*/} <target-directory> [--dry-run]" >&2
+    exit 2
+fi
+if [[ ! -f $manifest ]]; then
+    echo "manifest not found: $manifest" >&2
+    exit 1
+fi
+
+mkdir -p "$target"
+cd "$target"
+
+is_maintained() {
+    local pkg=$1
+    local candidate
+    for candidate in "${MAINTAINED_AUR_PACKAGES[@]}"; do
+        [[ $candidate == "$pkg" ]] && return 0
+    done
+    return 1
+}
+
+run() {
+    if (( dry_run )); then
+        printf '  would run:'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+created=0
+updated=0
+
+while IFS=$'\t' read -r dir remote url; do
+    [[ -z ${dir:-} || $dir == \#* ]] && continue
+
+    if [[ ! -d $dir/.git ]]; then
+        echo "Cloning $dir from $url"
+        run git clone --origin "$remote" "$url" "$dir"
+        (( ++created ))
+    elif ! git -C "$dir" remote | grep -qx "$remote"; then
+        echo "Adding remote '$remote' to existing clone $dir"
+        run git -C "$dir" remote add "$remote" "$url"
+        (( ++updated ))
+    fi
+
+    # An AUR fetch URL of the form https://aur.archlinux.org/<pkg>.git gets an
+    # SSH push URL when the package is one of Stefan's. Everything else - the
+    # acrion GitHub clones and the Arch packaging GitLab - keeps whatever the
+    # clone already has, so this script never redirects where a push would go.
+    if [[ $url =~ ^https://aur\.archlinux\.org/(.+)\.git$ ]]; then
+        pkg=${BASH_REMATCH[1]}
+        if is_maintained "$pkg"; then
+            echo "  $dir: SSH push URL for maintained package '$pkg'"
+            # Replace rather than add: --add would accumulate a second push URL
+            # on every re-run, and this script has to be safe to run again.
+            run git -C "$dir" remote set-url --push "$remote" \
+                "ssh://aur@aur.archlinux.org/$pkg"
+        fi
+    fi
+done < "$manifest"
+
+echo
+echo "Done. $created clone(s) created, $updated remote(s) added in $target."
+echo
+echo "Next: seed the artefacts and the makepkg source cache from an existing"
+echo "host, otherwise the first run rebuilds every package and takes days."

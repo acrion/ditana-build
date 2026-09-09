@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Control for export-signing-subkey, against a throwaway key of the same shape.
+#
+# The shape is the point. An earlier version fed one answer to a --passwd that
+# asks for the old passphrase once per secret key in the block, so it worked on
+# a key with no subkeys and silently did nothing on the real one -- which has a
+# certifying primary, an encryption subkey and a signing subkey. A test with a
+# single key would have passed against the broken version, so this builds all
+# three, under a passphrase, and runs the real script against it.
+#
+# Everything happens in a GNUPGHOME under /dev/shm. The real keyring is never
+# touched, and nothing reaches a disk.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT=$HERE/export-signing-subkey
+[[ -x $SCRIPT ]] || { echo "FAIL: $SCRIPT is missing"; exit 1; }
+
+WORK=$(mktemp -d -p /dev/shm) || { echo "FAIL: no /dev/shm"; exit 1; }
+chmod 700 "$WORK"
+cleanup() {
+    GNUPGHOME=$WORK/home gpgconf --kill all >/dev/null 2>&1
+    GNUPGHOME=$WORK/check gpgconf --kill all >/dev/null 2>&1
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+pass=0; fail=0
+ok()  { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no()  { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+yes() { if [[ -n $2 ]]; then ok "$1"; else no "$1"; fi }
+
+mkdir -p "$WORK/home"; chmod 700 "$WORK/home"
+export GNUPGHOME=$WORK/home
+PHRASE=correcthorse
+
+echo "building a throwaway key: certifying primary, encryption and signing subkey"
+gpg --batch --passphrase "$PHRASE" --quick-gen-key "Control <control@example.invalid>" \
+    rsa2048 cert 1d >/dev/null 2>&1 || { echo "FAIL: could not create the key"; exit 1; }
+PRIMARY=$(gpg --list-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
+for usage in encr sign; do
+    gpg --batch --pinentry-mode loopback --passphrase "$PHRASE" \
+        --quick-add-key "$PRIMARY" rsa2048 "$usage" 1d >/dev/null 2>&1
+done
+SUB=$(gpg --list-keys --with-colons --with-subkey-fingerprint "$PRIMARY" |
+      awk -F: '$1=="sub" && $12 ~ /s/ {want=1} $1=="fpr" && want {print $10; exit}')
+[[ -n $SUB ]] || { echo "FAIL: no signing subkey"; exit 1; }
+n=$(ls "$GNUPGHOME/private-keys-v1.d" | wc -l)
+is3=""; [[ $n -eq 3 ]] && is3=y
+yes "the throwaway key really has three secret keys, as the real one does" "$is3"
+
+echo
+echo "the script:"
+OUT=$WORK/out.gpg
+printf '%s\n' "$PHRASE" | "$SCRIPT" "$SUB" "$OUT" >/dev/null 2>&1
+exists=""; [[ -s $OUT ]] && exists=y
+yes "it writes a file" "$exists"
+
+# The check that used to be here looked for the armour header, which a file
+# holding nothing but the stub of the primary carries just as well -- and one
+# did, twice, and imported without an error while leaving no secret behind.
+got=$(gpg --list-packets "$OUT" 2>/dev/null | grep -c 'secret sub key packet')
+[[ ${got:-0} -ge 1 ]] && ok "the file really contains a secret subkey" \
+                      || no "the file really contains a secret subkey (found $got)"
+
+# The primary must not come along: that is the whole point of a subkey.
+stub=$(gpg --list-packets "$OUT" 2>/dev/null | grep -c 'gnu-dummy')
+[[ ${stub:-0} -ge 1 ]] && ok "the primary key travels only as a stub" \
+                       || no "the primary key travels only as a stub"
+
+echo
+echo "what the file does on the far side:"
+mkdir -p "$WORK/check"; chmod 700 "$WORK/check"
+GNUPGHOME=$WORK/check gpg --batch --import "$OUT" >/dev/null 2>&1
+left=$(ls "$WORK/check/private-keys-v1.d" 2>/dev/null | wc -l)
+[[ ${left:-0} -eq 1 ]] && ok "importing it leaves a secret key behind" \
+                       || no "importing it leaves a secret key behind (found $left)"
+
+echo probe > "$WORK/check/probe"
+GNUPGHOME=$WORK/check timeout 20 gpg --batch --yes --detach-sign --no-armor \
+    -u "${SUB}!" "$WORK/check/probe" >/dev/null 2>&1
+signed=""; [[ -f $WORK/check/probe.sig ]] && signed=y
+yes "it signs without asking for a passphrase" "$signed"
+GNUPGHOME=$WORK/check gpg --verify "$WORK/check/probe.sig" "$WORK/check/probe" >/dev/null 2>&1 \
+    && ok "and the signature verifies" || no "and the signature verifies"
+
+echo
+echo "what it refuses:"
+rm -f "$WORK/out2.gpg"
+printf 'wrong\n' | "$SCRIPT" "$SUB" "$WORK/out2.gpg" >/dev/null 2>&1
+[[ ! -e $WORK/out2.gpg ]] && ok "a wrong passphrase leaves no file behind" \
+                          || no "a wrong passphrase leaves no file behind"
+printf '%s\n' "$PHRASE" | "$SCRIPT" "$PRIMARY" "$WORK/out3.gpg" >/dev/null 2>&1
+[[ ! -e $WORK/out3.gpg ]] && ok "the primary key itself is refused" \
+                          || no "the primary key itself is refused"
+
+echo
+echo "--- $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

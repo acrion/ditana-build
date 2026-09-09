@@ -1,0 +1,246 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Find cached VCS clones that makepkg will refuse to reuse.
+
+makepkg keeps one clone per source entry in SRCDEST and checks, before
+fetching, that its `remote.origin.url` still matches the URL in the PKGBUILD.
+When an upstream project is renamed or moved -- which happens a few times a
+year across ~57 packages -- the cached clone no longer matches and makepkg
+aborts with "... is not a clone of ...". In an unattended daily run that
+failure arrives hours in, after everything before it has already been built.
+
+This runs the same comparison up front, in seconds, so the run either starts
+clean or does not start at all.
+
+The URL and directory derivation mirrors libmakepkg exactly
+(/usr/share/makepkg/util/source.sh and source/git.sh); a divergence here would
+make the check useless, so the rules are transcribed rather than approximated.
+
+Exit codes:
+    0   every cached clone matches
+    2   at least one stale clone -- makepkg would abort
+    1   the check itself could not decide
+"""
+
+import argparse
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+VCS_PROTOCOLS = ("bzr", "fossil", "git", "hg", "svn")
+
+
+def load_gate():
+    """Reuse the review gate's PKGBUILD parser rather than write a second one."""
+    path = os.path.join(HERE, "pkgbuild-review-gate")
+    spec = importlib.util.spec_from_loader(
+        "pkgbuild_review_gate",
+        importlib.machinery.SourceFileLoader("pkgbuild_review_gate", path),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def makepkg_srcdest():
+    """Read SRCDEST the way makepkg does: user configuration wins."""
+    for conf in (os.path.expanduser("~/.makepkg.conf"), "/etc/makepkg.conf"):
+        try:
+            text = open(conf).read()
+        except OSError:
+            continue
+        m = re.search(r"^\s*SRCDEST=(.+)$", text, re.MULTILINE)
+        if m:
+            value = m.group(1).strip().strip('"').strip("'")
+            if value:
+                return os.path.expanduser(os.path.expandvars(value))
+    return None
+
+
+def get_protocol(netfile):
+    if "://" in netfile:
+        proto = netfile.split("::", 1)[-1]
+        proto = proto.split("://", 1)[0]
+        return proto.split("+", 1)[0]
+    if "lp:" in netfile:
+        return netfile.split("::", 1)[-1].split("+lp:", 1)[0]
+    return "local"
+
+
+def get_filename(netfile, proto):
+    if "::" in netfile:
+        return netfile.split("::", 1)[0]
+    if proto in VCS_PROTOCOLS:
+        name = netfile.split("#", 1)[0].split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if proto == "bzr" and "lp:" in name:
+            name = name.split("lp:", 1)[1]
+        if proto == "fossil":
+            name += ".fossil"
+        if proto == "git":
+            name = name.split(".git", 1)[0]
+        return name
+    return netfile.rsplit("/", 1)[-1]
+
+
+def get_url(netfile):
+    """The URL makepkg will hand to git: no filename, no proto prefix, no fragment."""
+    url = netfile.split("::", 1)[-1]
+    url = re.sub(r"^[a-z]+\+", "", url)
+    return url.split("#", 1)[0].split("?", 1)[0]
+
+
+def cached_origin(directory):
+    r = subprocess.run(
+        ["git", "-c", "safe.bareRepository=all", "-C", directory,
+         "config", "--get", "remote.origin.url"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def strip_git_suffix(url):
+    return url[:-4] if url.endswith(".git") else url
+
+
+def find_pkgbuild(pkgdir):
+    """Locate the tracked PKGBUILD, wherever in the clone it sits.
+
+    It is not always at the root: 003-ditana-assistant keeps it in
+    packaging/arch/. Looking only at <pkgdir>/PKGBUILD skips such a package in
+    silence, which reads as "checked and clean" when nothing was checked at all.
+    """
+    r = subprocess.run(["git", "-C", pkgdir, "ls-files", "--", "*PKGBUILD"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    candidates = [p for p in r.stdout.splitlines()
+                  if os.path.basename(p) == "PKGBUILD"]
+    if len(candidates) != 1:
+        return None
+    return os.path.join(pkgdir, candidates[0])
+
+
+def check_package(gate, pkgdir, srcdest):
+    """Return (problems, unverifiable) for one package directory."""
+    problems, unverifiable = [], []
+    pkgbuild = find_pkgbuild(pkgdir)
+    if pkgbuild is None or not os.path.exists(pkgbuild):
+        unverifiable.append(f"{pkgdir}: no unique tracked PKGBUILD found")
+        return problems, unverifiable
+    startdir = os.path.dirname(pkgbuild)
+
+    try:
+        pkg = gate.PkgBuild(open(pkgbuild, encoding="utf-8", errors="replace").read(), pkgbuild)
+    except Exception as e:
+        unverifiable.append(f"{pkgdir}: PKGBUILD not parsable ({e})")
+        return problems, unverifiable
+
+    for name in pkg.source_arrays():
+        for raw in pkg.expanded_array(name):
+            proto = get_protocol(raw)
+            if proto not in VCS_PROTOCOLS:
+                continue
+            if "$" in raw:
+                unverifiable.append(f"{pkgdir}: {raw!r} cannot be resolved statically")
+                continue
+
+            filename = get_filename(raw, proto)
+            url = get_url(raw)
+
+            # get_filepath prefers a checkout inside $startdir, which is the
+            # directory holding the PKGBUILD, not the clone root.
+            for candidate in (os.path.join(startdir, filename),
+                              os.path.join(srcdest, filename) if srcdest else None):
+                if candidate and os.path.isdir(candidate):
+                    directory = candidate
+                    break
+            else:
+                continue  # not cached yet; makepkg will clone it fresh
+
+            if proto != "git":
+                # The other VCS backends check differently; flag them for a
+                # human rather than pretend to have verified them.
+                unverifiable.append(f"{pkgdir}: {proto} source {raw!r} not checked")
+                continue
+
+            origin = cached_origin(directory)
+            if origin is None:
+                problems.append(
+                    f"{pkgdir}: {directory} exists but is not a git repository; "
+                    f"makepkg expects a clone of {url}")
+                continue
+            if strip_git_suffix(url) != strip_git_suffix(origin):
+                problems.append(
+                    f"{pkgdir}: {directory}\n"
+                    f"      cached:   {origin}\n"
+                    f"      PKGBUILD: {url}\n"
+                    f"      makepkg will abort with \"is not a clone of\"")
+    return problems, unverifiable
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("packages", nargs="*",
+                   help="package directories (default: 00*-*/ below the cwd)")
+    p.add_argument("--srcdest", default=None, help="override SRCDEST")
+    p.add_argument("--fix", action="store_true",
+                   help="delete stale cached clones so makepkg re-clones them")
+    args = p.parse_args()
+
+    srcdest = args.srcdest or makepkg_srcdest()
+    if not srcdest:
+        print("SRCDEST is not configured; nothing is cached, nothing to check.")
+        return 0
+    if not os.path.isdir(srcdest):
+        print(f"SRCDEST {srcdest} does not exist yet; makepkg will create it.")
+        return 0
+
+    packages = args.packages or sorted(
+        d for d in os.listdir(".")
+        if os.path.isdir(d) and re.match(r"^00\d-.", d)
+    )
+    if not packages:
+        print("no package directories found", file=sys.stderr)
+        return 1
+
+    gate = load_gate()
+    all_problems, all_unverifiable = [], []
+    for pkgdir in packages:
+        problems, unverifiable = check_package(gate, pkgdir.rstrip("/"), srcdest)
+        all_problems += problems
+        all_unverifiable += unverifiable
+
+    if all_unverifiable:
+        print(f"{len(all_unverifiable)} source entr(ies) could not be checked:")
+        for u in all_unverifiable:
+            print(f"  - {u}")
+        print()
+
+    if not all_problems:
+        print(f"SRCDEST {srcdest}: all cached clones match their PKGBUILD.")
+        return 0
+
+    print(f"{len(all_problems)} stale cached clone(s) in {srcdest}:\n")
+    for problem in all_problems:
+        print(f"  - {problem}")
+
+    if args.fix:
+        print()
+        for problem in all_problems:
+            directory = problem.split(": ", 1)[1].splitlines()[0]
+            print(f"  removing {directory}")
+            subprocess.run(["rm", "-rf", "--", directory], check=True)
+        print("\nRemoved. The next run will clone these afresh, which costs "
+              "bandwidth but no manual work.")
+        return 0
+
+    print("\nRe-run with --fix to delete them, or move them aside by hand.")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

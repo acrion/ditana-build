@@ -1,0 +1,86 @@
+#
+# pacman.conf for the Ditana build chroot
+#
+# Template. bin/setup-buildroot substitutes @REPO@ with the absolute path of
+# the staging repository inside the package tree and installs the result as
+# /etc/ditana/pacman-buildroot.conf.
+#
+# This file is the reason the pipeline no longer edits the host's pacman.conf.
+# Nothing here applies to the running system.
+#
+
+[options]
+HoldPkg      = pacman glibc
+Architecture = auto
+ParallelDownloads = 5
+DownloadUser = alpm
+
+# A package cache of its own, and deliberately the *only* one: the host's
+# /var/cache/pacman/pkg must not be listed.
+#
+# pacman copies even a file:// package into its cache and then searches every
+# cache directory by file name. A rebuild that keeps its version -- which is
+# exactly what a toolchain rebuild is -- produces a different file under the
+# name it had before, so a copy left anywhere pacman looks is rejected against
+# the new checksum and fails the whole transaction. The build machine runs
+# Ditana and therefore has Ditana packages in its own cache, so listing it
+# would make that collision a recurring event rather than an accident.
+#
+# The pipeline drops a package's name from this directory as it stages it,
+# which it can only do because the directory belongs to the build user.
+# Everything else stays cached between runs, so official packages are fetched
+# once rather than once per run.
+#
+# Do not begin any line of this file with "CacheDir" behind a comment marker.
+# arch-nspawn rewrites every line matching ^#?\s*CacheDir with the list of
+# directories it is about to bind -- that is how it fills in the commented-out
+# default of a stock pacman.conf. A comment that starts with the word turns
+# into a second directive, the list then grows on every invocation, and the
+# repeated entry gets bind-mounted read-only on top of the writable one, so
+# nothing is ever cached again.
+CacheDir = @CACHE@
+
+# systemd-nspawn does not pass landlock through, and pacman's sandbox aborts
+# without it ("restricting filesystem access failed because landlock is not
+# supported by the kernel"). aurto disables both for the same reason.
+DisableSandboxFilesystem
+DisableSandboxSyscalls
+
+SigLevel          = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+
+# The packages this run has already built. arch-nspawn bind-mounts every
+# file:// server it finds in this file into the container by itself, so no
+# separate mount is configured anywhere.
+#
+# This is the only Ditana repository the chroot can see, and it is how the
+# build order encoded in the numeric directory prefixes is realised:
+# 001-wf-msg-git resolves 001-wayfire-plugins-extra from here, 002-* resolves
+# 001-*, and so on. The pipeline empties the directory at the start of a run
+# and stages every package into it as it goes -- including the ones that did
+# not need rebuilding, which are dependencies just the same.
+#
+# TrustAll, and that is not a weakening. There is no transport here to protect:
+# the directory was written by this pipeline, in this run, on this machine, and
+# a signature would be checked against the key that had just produced it. The
+# check that actually matters -- can a *user* install what we signed? -- is
+# performed against the pacman keyring right after signing, in
+# gpg_sign_file(). Requiring it here instead covered only those packages that
+# some later package happened to depend on, and made a build host that holds no
+# key unable to resolve its own dependencies at all.
+#
+# The section is named after the database file (ditana.db), not after the
+# testing repository it holds: on a user's machine the same section is filled
+# by a different mirrorlist.
+[ditana]
+SigLevel = Optional TrustAll
+Server = file://@REPO@

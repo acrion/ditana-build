@@ -1,0 +1,69 @@
+# Package directories of the Ditana repository and the git remote each one
+# tracks.
+#
+# The three-digit prefix is the build order, not decoration: a package that
+# depends on another Ditana package belongs in a later group than the one that
+# provides it. See sorted_subdirs() in bin/build-ditana-packages.
+#
+# directory<TAB>remote-name<TAB>fetch-url
+001-auracle-git	origin	https://aur.archlinux.org/auracle-git.git
+001-b43-firmware	origin	https://aur.archlinux.org/b43-firmware.git
+001-backintime	origin	https://aur.archlinux.org/backintime.git
+001-bubblejail	origin	https://aur.archlinux.org/bubblejail.git
+001-ckbcomp	origin	https://aur.archlinux.org/ckbcomp.git
+001-code-marketplace	origin	https://aur.archlinux.org/code-marketplace.git
+001-ditana-filesystem	origin	git@github.com:acrion/ditana-filesystem.git
+001-ditana-keyring	origin	git@github.com:acrion/ditana-keyring.git
+001-ditana-mirrorlist	origin	git@github.com:acrion/ditana-mirrorlist.git
+001-ditana-network	origin	git@github.com:acrion/ditana-network.git
+001-ditana-print-system-infos	origin	git@github.com:acrion/ditana-print-system-infos.git
+001-ditana-testing-mirrorlist	origin	git@github.com:acrion/ditana-testing-mirrorlist.git
+001-ditana-userns-guard	origin	git@github.com:acrion/ditana-userns-guard.git
+001-dracula-gtk-theme	origin	https://aur.archlinux.org/dracula-gtk-theme.git
+001-fluffychat	origin	https://aur.archlinux.org/fluffychat.git
+001-fresh-editor-bin	origin	https://aur.archlinux.org/fresh-editor-bin.git
+001-fsearch	origin	https://aur.archlinux.org/fsearch.git
+001-hardened_malloc	acrion	git@github.com:acrion/hardened_malloc_aur.git
+001-hardened_malloc	origin	https://aur.archlinux.org/hardened_malloc.git
+001-kalu	origin	https://aur.archlinux.org/kalu.git
+001-kora-yellow-icon-theme	origin	git@github.com:acrion/kora-yellow-icon-theme.git
+001-libtsm	origin	https://aur.archlinux.org/libtsm.git
+001-lightdm-settings	origin	https://aur.archlinux.org/lightdm-settings.git
+001-logseq-desktop-bin	origin	https://aur.archlinux.org/logseq-desktop-bin.git
+001-monique	origin	https://aur.archlinux.org/monique.git
+001-mugshot	origin	https://aur.archlinux.org/mugshot.git
+001-nexuslua	aur	https://aur.archlinux.org/nexuslua.git
+001-niri-git	origin	https://aur.archlinux.org/niri-git.git
+001-niri-settings-git	origin	https://aur.archlinux.org/niri-settings-git.git
+001-nvidia-470xx-utils	origin	https://aur.archlinux.org/nvidia-470xx-utils.git
+001-nvidia-525xx-utils	origin	https://aur.archlinux.org/nvidia-525xx-utils.git
+001-nvidia-580xx-utils	origin	https://aur.archlinux.org/nvidia-580xx-utils.git
+001-nwg-launchers	origin	https://aur.archlinux.org/nwg-launchers.git
+001-pachub	origin	https://aur.archlinux.org/pachub.git
+001-paru	origin	https://aur.archlinux.org/paru.git
+001-perl-boolean	origin	https://aur.archlinux.org/perl-boolean.git
+001-pinta	origin	https://aur.archlinux.org/pinta.git
+001-python-proxy_tools	origin	https://aur.archlinux.org/python-proxy_tools.git
+001-rakudo-bin	origin	https://aur.archlinux.org/rakudo-bin.git
+001-rate-mirrors	origin	https://aur.archlinux.org/rate-mirrors.git
+001-stress-ng	origin	https://gitlab.archlinux.org/archlinux/packaging/packages/stress-ng.git
+001-system76-power	origin	https://aur.archlinux.org/system76-power.git
+001-timeshift-autosnap	origin	https://aur.archlinux.org/timeshift-autosnap.git
+001-ttf-twemoji	origin	https://aur.archlinux.org/ttf-twemoji.git
+001-wayfire-plugins-extra	origin	https://aur.archlinux.org/wayfire-plugins-extra.git
+001-wayland-display-info	origin	https://aur.archlinux.org/wayland-display-info.git
+001-wdisplays-persistent	origin	https://aur.archlinux.org/wdisplays-persistent.git
+001-wdisplays-persistent	upstream	https://aur.archlinux.org/wdisplays.git
+001-wezterm-git	origin	https://aur.archlinux.org/wezterm-git.git
+001-wf-msg-git	origin	https://aur.archlinux.org/wf-msg-git.git
+001-xdg-terminal-exec-git	origin	https://aur.archlinux.org/xdg-terminal-exec-git.git
+001-xfce-display-config-observer	origin	git@github.com:acrion/xfce-display-config-observer.git
+001-xfce-wallpaper-overlay	origin	git@github.com:acrion/xfce-wallpaper-overlay.git
+001-zelph	aur	https://aur.archlinux.org/zelph.git
+001-zfs-utils	origin	https://aur.archlinux.org/zfs-utils.git
+002-python-pywebview	origin	https://aur.archlinux.org/python-pywebview.git
+002-wayland-font-dpi	origin	git@github.com:acrion/wayland-font-dpi.git
+002-zfs-autosnap	origin	git@github.com:acrion/zfs-autosnap.git
+002-zfs-dkms	origin	https://aur.archlinux.org/zfs-dkms.git
+002-zfsbootmenu	origin	https://aur.archlinux.org/zfsbootmenu.git
+003-ditana-assistant	origin	git@github.com:acrion/ditana-assistant.git

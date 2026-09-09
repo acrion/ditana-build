@@ -1,0 +1,82 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Release a run to production once its test installation has passed.
+
+The build host signs with the subkey and uploads to testing by itself, so the
+step that used to happen on the workstation happens here -- but it cannot happen
+where --release happens inside the build, because that runs before the test
+installation it is supposed to be gated on. Worse, while the host uploaded
+nothing, that test installed from a testing repository which by definition did
+not hold what had just been built: the verdict described the previous state.
+
+So the order is build, upload to testing, install what was uploaded, and only
+then this. Nothing here decides anything by itself: release_refusal() already
+weighs the verdict for the workstation, release_to_production() already performs
+the release, and test_install_verdict() already reads the record. Two answers to
+"may this run be released" would drift apart, and this is the question where
+drifting apart means shipping a repository nobody can install.
+
+Run:  release-after-test [--packages DIR] [--untested]
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load(name):
+    """Import a pipeline script that has no .py extension."""
+    path = os.path.join(HERE, name)
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--packages", default=os.path.expanduser("~/packages"),
+                        help="package tree holding build-runs/ (default: ~/packages)")
+    parser.add_argument("--untested", action="store_true",
+                        help="release a run that carries no verdict at all "
+                             "(a failed one is refused regardless)")
+    args = parser.parse_args()
+
+    publish = load("publish-ditana-build")
+    # Through publish rather than through load(), so that the module which
+    # reaches the servers exists once in this process and not twice.
+    pipeline = publish.pipeline_module()
+
+    # The pipeline works in the package tree, and release_to_production() finds
+    # its script relative to this file rather than to the working directory, so
+    # the only thing the chdir affects is where the run records are read from.
+    os.chdir(args.packages)
+
+    verdict = publish.test_install_verdict(args.packages)
+    refusal = publish.release_refusal(verdict, args.untested)
+    if refusal:
+        print(refusal)
+        pipeline.notify("Ditana release refused", refusal)
+        return 1
+
+    failure = pipeline.release_to_production()
+    if failure:
+        print(failure)
+        publish.publish_run_record(args.packages, outcome="in-testing", message=failure)
+        pipeline.notify("Ditana release failed", failure)
+        return 1
+
+    detail = "released from the build host after a passing test installation"
+    publish.publish_run_record(args.packages, outcome="released", message=detail)
+    print(f"--- {detail}")
+    pipeline.notify("Ditana released", detail)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

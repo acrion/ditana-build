@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Export a signing subkey without its passphrase, for an unattended build host.
+#
+#     export-signing-subkey <subkey-fingerprint> <output-file>
+#
+# Run on the machine that holds the primary key. The primary key itself is
+# never exported: what lands in the output file is the subkey alone, and the
+# build host ends up with a stub where the primary key would be, so it can sign
+# but not certify and not make a new subkey.
+#
+# The passphrase has to be stripped somewhere, and it cannot be done on the
+# build host: after importing a subkey, gpg's --passwd resolves to the primary
+# key, finds only the stub, and fails with "No secret key". So it happens here,
+# in a throwaway keyring under /dev/shm that holds an unprotected copy of the
+# primary key for the few seconds this script runs. That copy never reaches a
+# disk and is deleted on every exit path, including a failure. The real keyring
+# is not touched at all.
+
+set -euo pipefail
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+subkey=${1:-}
+output=${2:-}
+[[ -n $subkey && -n $output ]] ||
+    die "usage: ${0##*/} <subkey-fingerprint> <output-file>"
+[[ $subkey =~ ^[A-Fa-f0-9]{40}$ ]] ||
+    die "not a fingerprint: $subkey (expected 40 hex digits)"
+if [[ -e $output ]]; then
+    die "$output exists; refusing to overwrite a secret key"
+fi
+
+# Everything below the primary key this subkey belongs to.
+primary=$(gpg --list-keys --with-colons "$subkey" 2>/dev/null |
+          awk -F: '/^fpr:/{print $10; exit}') ||
+    die "no key found for $subkey"
+[[ -n $primary ]] || die "no key found for $subkey"
+[[ $primary != "$subkey" ]] ||
+    die "$subkey is a primary key, not a subkey. Exporting a primary key to a
+build host is exactly what the subkey exists to avoid."
+
+# Refuse a subkey that cannot sign, which would produce a build host that
+# fails at the first package rather than at this line.
+gpg --list-keys --with-colons --with-subkey-fingerprint "$primary" |
+    awk -F: -v want="$subkey" '
+        /^sub:/ { usage = $12 }
+        /^fpr:/ { if ($10 == want && usage ~ /s/) { found = 1 } }
+        END { exit !found }
+    ' || die "$subkey is not a signing subkey of $primary"
+
+# The machine this exports *to* must never run it: after importing a subkey it
+# holds a stub where the primary key would be, and exporting from a stub would
+# produce a file that signs nothing. gpg says which it is -- field 15 of the sec
+# record is '#' for a stub and '+' where the secret key is really there.
+#
+# This used to test for /etc/ditana/package-build.conf, and that was wrong in
+# the one case that matters. The workstation is a build host as well, on purpose
+# and for reproducibility, and it is also the only machine holding the primary
+# key -- so the check refused the very machine it was meant to run on.
+have_primary=$(gpg --list-secret-keys --with-colons "$primary" 2>/dev/null |
+               awk -F: '/^sec:/{print $15; exit}')
+[[ -n $have_primary ]] ||
+    die "no secret key for $primary here. Run this where the primary key is."
+[[ $have_primary != "#" ]] ||
+    die "$primary is only a stub here -- this machine can sign but not export.
+Run this where the primary key really is."
+
+printf 'Primary key: %s\n' "$primary" >&2
+printf 'Subkey:      %s\n\n' "$subkey" >&2
+
+# /dev/shm so that the unprotected copy exists in memory only. mktemp -p keeps
+# it out of anything a backup or a snapshot would pick up.
+work=$(mktemp -d -p /dev/shm) || die "could not create a temporary keyring"
+verify=$(mktemp -d -p /dev/shm) || die "could not create a temporary keyring"
+chmod 700 "$work" "$verify"
+cleanup() { rm -rf "$work" "$verify"; }
+trap cleanup EXIT
+
+read -rsp "Passphrase of $primary: " passphrase
+echo >&2
+
+# Only this one subkey is taken across, and taking it first is what makes the
+# rest work. --passwd asks for the old passphrase once per secret key in the
+# block, so a keyring holding the primary and two subkeys needs three answers
+# and an earlier version of this script gave one -- it then reported success
+# having changed nothing, and everything after it failed quietly. With a single
+# secret key in the throwaway keyring the sequence is knowable.
+gpg --batch --pinentry-mode loopback --passphrase "$passphrase" \
+    --export-secret-subkeys "${subkey}!" 2>/dev/null |
+    GNUPGHOME=$work gpg --batch --import 2>/dev/null ||
+    die "could not read the subkey -- wrong passphrase?"
+GNUPGHOME=$work gpg --list-secret-keys "$subkey" >/dev/null 2>&1 ||
+    die "could not read the subkey -- wrong passphrase?"
+
+# The first line answers the old passphrase, the two empty ones set an empty new
+# one, and the y confirms gpg's warning about not using a passphrase at all.
+#
+# The exit status is deliberately ignored: gpg 2.4 returns 2 here even when it
+# has done the work. What the passphrase is really gone is decided below, by
+# exporting without one and looking at what comes out -- an outcome that cannot
+# be reported wrongly the way a status can.
+printf '%s\n\n\ny\n' "$passphrase" |
+    GNUPGHOME=$work gpg --pinentry-mode loopback --command-fd 0 \
+        --passwd "${subkey}!" >/dev/null 2>&1 || true
+unset passphrase
+
+umask 077
+GNUPGHOME=$work gpg --batch --pinentry-mode loopback --passphrase "" \
+    --export-secret-subkeys --armor "${subkey}!" >"$output" ||
+    { rm -f "$output"; die "the export failed"; }
+
+# Not a grep for the armour header. A file holding nothing but the stub of the
+# primary key carries that header too, and one did: it imported without an error
+# and left no secret key behind, on two machines, before anybody looked inside.
+gpg --list-packets "$output" 2>/dev/null | grep -q 'secret sub key packet' ||
+    { rm -f "$output"; die "the export contains no secret subkey"; }
+
+# Prove the file does what it is for before it is carried to another machine:
+# import it into a keyring that has nothing else in it, and sign without any
+# prompt. A file that still asks for a passphrase would only be discovered by
+# an unattended run hanging at three in the morning.
+GNUPGHOME=$verify gpg --batch --import "$output" >/dev/null 2>&1 ||
+    { rm -f "$output"; die "the exported key cannot be imported"; }
+echo verification >"$verify/probe"
+GNUPGHOME=$verify timeout 20 gpg --batch --yes --detach-sign --no-armor \
+    -u "${subkey}!" "$verify/probe" >/dev/null 2>&1 ||
+    { rm -f "$output"; die "the exported key still asks for a passphrase"; }
+GNUPGHOME=$verify gpg --verify "$verify/probe.sig" "$verify/probe" >/dev/null 2>&1 ||
+    { rm -f "$output"; die "the signature made with the exported key does not verify"; }
+
+cat >&2 <<EOF
+
+Wrote $output -- an unprotected secret key. Anyone who reads it can sign
+packages as Ditana until the subkey is revoked.
+
+Next:
+  1. Copy it to the build host and import it there.
+  2. Delete it here and on the way.
+  3. Only after the ditana-keyring carrying this subkey has had its grace
+     period, point SIGNING_KEY in bin/build-ditana-packages at
+     ${subkey}!
+EOF

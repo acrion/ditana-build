@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# What the banner probe does, against a listener that is not a guest.
+#
+# The probe is the second half of the verdict: an installation can write every
+# file correctly and still produce a machine that never comes up, and this loop
+# is what tells the two apart. It is lifted out of the real script between its
+# markers rather than reproduced, for the reason ditana-package-build-test
+# gives at greater length: a copy drifts, and a copy of a loop that decides a
+# release drifts expensively.
+#
+# The whole guest is not needed to test it. What is needed is something that
+# answers on a port, something that answers with the wrong thing, and nothing
+# at all -- and those are three python listeners.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+HARNESS=$HERE/test-install-in-qemu
+[[ -f $HARNESS ]] || { echo "FAIL: $HARNESS is missing"; exit 1; }
+
+probe=$(sed -n '/^# --- BEGIN banner-probe/,/^# --- END banner-probe/p' "$HARNESS")
+[[ -n $probe ]] ||
+    { echo "FAIL: the banner probe markers are gone from $HARNESS"; exit 1; }
+grep -q 'END banner-probe' <<<"$probe" ||
+    { echo "FAIL: only half of the banner probe could be lifted out"; exit 1; }
+
+WORK=$(mktemp -d) || { echo "FAIL: no temporary directory"; exit 1; }
+listener=""
+cleanup() { [[ -n $listener ]] && kill "$listener" 2>/dev/null; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+pass=0; fail=0
+ok() { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no() { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+is() {
+    if [[ "$2" == "$3" ]]; then printf '  ok   %s\n' "$1"; pass=$((pass+1))
+    else printf '  FAIL %s\n    expected: %s\n    got:      %s\n' "$1" "$3" "$2"; fail=$((fail+1)); fi
+}
+
+#| Serve one line to everything that connects, until killed.
+serve() {
+    python3 - "$1" "$2" <<'PY' &
+import socket, sys
+port, line = int(sys.argv[1]), sys.argv[2]
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(5)
+while True:
+    c, _ = s.accept()
+    if line:
+        c.sendall((line + "\r\n").encode())
+    c.close()
+PY
+    listener=$!
+    for _ in $(seq 40); do
+        (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null && { exec 3<&-; return 0; }
+        sleep 0.1
+    done
+    return 1
+}
+
+#| Run the lifted probe against a port and report what it decided.
+run_probe() {
+    local port=$1 timeout=$2
+    local script="SSH_PORT=$port
+BOOT_TIMEOUT=$timeout
+boot_pid=\$\$
+$probe
+echo \"banner=[\${banner%%\$'\\r'*}]\"
+echo 'stderr still works' >&2"
+    bash -c "$script"
+}
+
+PORT=${DITANA_TEST_PROBE_PORT:-42222}
+
+echo "a listener that answers like sshd:"
+serve "$PORT" "SSH-2.0-OpenSSH_10.5" || { echo "FAIL: the listener never came up"; exit 1; }
+out=$(run_probe "$PORT" 30 2>"$WORK/err")
+is "the banner is read"      "$out" "banner=[SSH-2.0-OpenSSH_10.5]"
+# The defect this pins. `exec 3<>... 2>/dev/null` applies BOTH redirections to
+# the shell, so the first probe that connected silenced the script for the rest
+# of the run -- and everything the run record keeps about a failure is written
+# to stderr after this point: the reason, and the line naming the screenshot.
+is "and stderr survives the connection" "$(cat "$WORK/err")" "stderr still works"
+kill "$listener" 2>/dev/null; listener=""
+
+echo
+echo "a listener that answers with something else:"
+serve "$PORT" "220 ProFTPD Server ready" || { echo "FAIL: the listener never came up"; exit 1; }
+out=$(run_probe "$PORT" 6 2>"$WORK/err2")
+is "it is not mistaken for a banner" "$out" "banner=[]"
+is "and stderr still survives"       "$(cat "$WORK/err2")" "stderr still works"
+kill "$listener" 2>/dev/null; listener=""
+
+echo
+echo "nothing listening at all:"
+# The refusals a booting guest produces on every probe. They must not reach
+# stderr: a passing run printed two of them and read as a failed one.
+out=$(run_probe "$PORT" 6 2>"$WORK/err3")
+is "it gives up with no banner"  "$out" "banner=[]"
+is "and says nothing about the refusals" "$(cat "$WORK/err3")" "stderr still works"
+
+echo "what the harness reads out of the serial log:"
+abort=$(sed -n '/^# --- BEGIN autoinstall-abort/,/^# --- END autoinstall-abort/p' "$HARNESS")
+[[ -n $abort ]] ||
+    { echo "FAIL: the autoinstall abort markers are gone from $HARNESS"; exit 1; }
+grep -q 'END autoinstall-abort' <<<"$abort" ||
+    { echo "FAIL: only half of the autoinstall abort could be lifted out"; exit 1; }
+
+#| Run the lifted reader over one serial log and report what it found.
+read_abort() {  # $1: path to a log file
+    bash -c "$abort
+if out=\$(autoinstall_abort '$1'); then printf 'found:%s\n' \"\$out\"; else echo 'nothing'; fi"
+}
+
+# A log of an installation that is going fine says nothing about an abort.
+printf 'BdsDxe: starting Boot0002\r\nDitana GNU/Linux install medium\r\n' > "$WORK/quiet.log"
+is "a log with no marker reports nothing" "$(read_abort "$WORK/quiet.log")" "nothing"
+
+# A log that does not exist yet is the first second of every run.
+is "a log that is not there yet reports nothing" "$(read_abort "$WORK/absent.log")" "nothing"
+
+# The real shape: console escape sequences around it, a carriage return at the
+# end of every line, and the message spread over several lines because the
+# installer prefixes each one.
+{
+    printf '\033[2J\033[001;001HBooting\r\n'
+    printf 'DITANA-AUTOINSTALL-ABORT: Autoinstall: /run/x.kdl asks for settings this installation cannot honour:\r\n'
+    printf 'DITANA-AUTOINSTALL-ABORT:   - zfs-filesystem = True cannot be set, because the setting is not available on this machine. It requires: install-standard-lts-kernel\r\n'
+} > "$WORK/refused.log"
+out=$(read_abort "$WORK/refused.log")
+case $out in
+    found:*) ok "a log carrying the marker is recognised" ;;
+    *)       no "a log carrying the marker is recognised: got $out" ;;
+esac
+case $out in
+    *"zfs-filesystem"*) ok "and the setting that was refused survives into the message" ;;
+    *)                  no "and the setting that was refused survives into the message: got $out" ;;
+esac
+case $out in
+    *"install-standard-lts-kernel"*) ok "and so does the condition that would make it possible" ;;
+    *)                               no "and so does the condition that would make it possible: got $out" ;;
+esac
+# The marker is a machine's handle on the message, not part of it. Leaving it
+# in would put it in front of the operator twice.
+case $out in
+    *DITANA-AUTOINSTALL-ABORT*) no "the marker itself is stripped: it is still there" ;;
+    *)                          ok "the marker itself is stripped" ;;
+esac
+
+# The shape the guest really produces, and the one that cost a release run:
+# ncurses draws the boot menu with escape sequences and never a newline, so the
+# first marker arrives on the same physical line as the whole menu. Both
+# messages have to come out of that, not just the last one.
+{
+    printf '\033[2J\033[001;001H'
+    for s in 60 59 58; do printf 'Boot in %ss.\033[024;046H' "$s"; done
+    printf 'DITANA-AUTOINSTALL-ABORT: Autoinstall: the first complaint'
+    printf 'DITANA-AUTOINSTALL-ABORT: Autoinstall: the second complaint\r\n'
+} > "$WORK/glued.log"
+out=$(read_abort "$WORK/glued.log")
+case $out in
+    *"the first complaint"*) ok "a marker glued to the boot menu is still read" ;;
+    *)                       no "a marker glued to the boot menu is still read: got $out" ;;
+esac
+case $out in
+    *"the second complaint"*) ok "and a second marker on the same line is not lost" ;;
+    *)                        no "and a second marker on the same line is not lost: got $out" ;;
+esac
+case $out in
+    *"Boot in 58s"*) no "the menu drawn before it is dropped: it came through" ;;
+    *)               ok "the menu drawn before it is dropped" ;;
+esac
+# A stray \r ends up in the middle of the text when it is joined, and the
+# message is what a person reads.
+case $out in
+    *$'\r'*) no "the console's carriage returns are stripped: one is left" ;;
+    *)       ok "the console's carriage returns are stripped" ;;
+esac
+
+echo "what the medium verdict makes of what was watched:"
+verdict=$(sed -n '/^# --- BEGIN medium-verdict/,/^# --- END medium-verdict/p' "$HARNESS")
+[[ -n $verdict ]] ||
+    { echo "FAIL: the medium verdict markers are gone from $HARNESS"; exit 1; }
+grep -q 'END medium-verdict' <<<"$verdict" ||
+    { echo "FAIL: only half of the medium verdict could be lifted out"; exit 1; }
+
+#| Run the lifted verdict over one observation and report what it decided.
+judge() {   # $1: medium_finished  $2: medium_written (unset if empty)
+    local script="die() { echo \"died: \$*\"; exit 3; }
+$verdict
+medium_finished=$1
+${2:+medium_written=$2}
+medium_verdict
+echo 'accepted'"
+    bash -c "$script" 2>&1 | head -1
+}
+
+is "a medium that sat there and wrote nothing is accepted" "$(judge 0 0)" "accepted"
+# The installer's last step is a reboot, and -no-reboot turns that into an exit.
+# A medium that got there with nothing attached installed on its own.
+is "a medium that ran to its final reboot is refused" \
+   "$(judge 1 0)" \
+   "died: The medium installed by itself: it reached its final reboot with no answer file attached. An ISO that does this erases the first machine it is booted on."
+# An installation under way has not exited yet, so the exit status alone would
+# call this a pass. The disk says otherwise.
+is "a medium that had begun writing is refused" \
+   "$(judge 0 3)" \
+   "died: The medium wrote to the disk with no answer file attached (3 extent(s)). An installation it was never asked for had already begun."
+# A check that could not be carried out is not a check that passed.
+is "an unanswerable disk check is refused, not waved through" \
+   "$(judge 0 '')" \
+   "died: The medium wrote to the disk with no answer file attached ( extent(s)). An installation it was never asked for had already begun."
+
+echo
+echo "counting what was written to an image:"
+extents=$(sed -n '/^written_extents() {/,/^}/p' <<<"$verdict")
+qemu-img create -f qcow2 "$WORK/blank.qcow2" 64M >/dev/null 2>&1
+is "an untouched image has written nothing" \
+   "$(bash -c "$extents"$'\n'"written_extents '$WORK/blank.qcow2'")" "0"
+# The first 64 kB, which is where a partition table goes -- and the smallest
+# thing an installation that has begun would have written.
+if command -v qemu-io >/dev/null; then
+    qemu-img create -f qcow2 "$WORK/used.qcow2" 64M >/dev/null 2>&1
+    qemu-io -f qcow2 -c "write -P 0x5a 0 64k" "$WORK/used.qcow2" >/dev/null 2>&1
+    written=$(bash -c "$extents"$'\n'"written_extents '$WORK/used.qcow2'")
+    if [[ ${written:-0} -gt 0 ]]; then
+        ok "an image that was written to has"
+    else
+        no "an image that was written to has (got $written)"
+    fi
+else
+    printf '  skip qemu-io is not installed, so a written image cannot be made here\n'
+fi
+
+echo
+echo "--- $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

@@ -1,0 +1,23 @@
+# Installed by bin/setup-buildroot.
+#
+# devtools needs root: arch-nspawn and makechrootpkg create and enter the
+# container. The pipeline itself must not run as root -- it works in the build
+# user's git clones and signs with that user's GPG and SSH keys -- so these two
+# commands are the only place where it escalates.
+#
+# This is a convenience boundary, not a security boundary. Whoever may run
+# makechrootpkg against a chroot they can write to is root in practice. The
+# arguments are pinned so that a mistake in the pipeline cannot reach a
+# different chroot, and so that a rule that no longer matches fails loudly:
+# the pipeline calls sudo with -n, which turns a mismatch into an immediate
+# error instead of a password prompt that would hang an unattended run until
+# its 20-hour timeout.
+#
+# Both lines must stay in step with update_buildroot() and build_in_chroot()
+# in bin/build-ditana-packages.
+#
+# aurto ships an equivalent but unpinned rule for %wheel on the same machines.
+# Do not rely on it: a build host has to work without aurto installed.
+
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/arch-nspawn -C /etc/ditana/pacman-buildroot.conf /var/lib/ditana-buildroot/root pacman -Syu --noconfirm
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/makechrootpkg -c -u -r /var/lib/ditana-buildroot -- -f --noconfirm --needed

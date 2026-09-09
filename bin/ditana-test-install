@@ -1,0 +1,365 @@
+#!/usr/bin/env -S python -u
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Install the testing repository into a virtual machine and record the result.
+
+    ditana-test-install [--packages DIR] [--iso PATH] [--answer-file PATH]
+
+Runs on the build host, after a build. The step it replaces is the one Stefan
+did by hand: a repository that builds, signs and uploads can still be one
+nobody can install from, and until now nothing but a person noticed.
+
+The verdict goes into the run's own record, next to the outcome, because that
+is where it becomes true -- the machine that publishes learns of it only
+through the records it fetches, and it refuses to release without one.
+
+A run that rebuilt nothing is tested anyway. The packages are the same, but
+the ISO, the installer and ditana-config are downloaded at install time and
+are not: a test that only ran when a package changed would go quiet exactly
+when the parts that changed were the untested ones.
+"""
+import argparse
+import datetime
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HARNESS = os.path.join(HERE, "test-install-in-qemu")
+
+DEFAULT_PACKAGES = os.path.expanduser("~/packages")
+DEFAULT_ISO_GLOB = os.path.expanduser("~/ditana-installer/out/*.iso")
+DEFAULT_ANSWER_FILE = os.path.expanduser(
+    "~/ditana-installer/examples/autoinstall-test-vm.kdl")
+DEFAULT_WORK_DIR = "/var/tmp/ditana-test-install"
+
+ISO_BLOCK = 2048
+ROOTFS_IMAGE = "airootfs.sfs"
+ROOTFS_SIGNATURE = ROOTFS_IMAGE + ".sig"
+VERSION_FILE = "root/ditana-version.sh"
+ENABLE_FILE = "root/bind-mount/root/enable-ditana.sh"
+TESTING_MIRRORLIST = "ditana-testing-mirrorlist"
+RELEASED_BRANCH = "main"
+
+
+def startlba(report):
+    """The block a file starts at, out of what `xorriso ... -exec report_lba` said.
+
+    The layout line names the columns and the data line carries them, so the
+    second field of the data line is the one wanted -- the first is the extent
+    number, which is 0 for a file written in one piece.
+
+    >>> startlba("Report layout: xt , Startlba ,   Blocks , Filesize , path\\n"
+    ...          "File data lba:  0 ,       33 ,        2 ,     4096 , '/x'")
+    33
+    >>> startlba("Media summary: 1 session, 186 data blocks") is None
+    True
+    """
+    for line in report.splitlines():
+        if "File data lba:" in line:
+            return int(line.split(",")[1].strip())
+    return None
+
+
+def branch_of(version_sh):
+    """The branch a medium was built from, out of the file the build wrote into it.
+
+    >>> branch_of("export DITANA_VERSION=0.9.4-Beta\\nexport DITANA_BRANCH=main\\n")
+    'main'
+    >>> branch_of("export DITANA_BRANCH=feature/serial-console\\n")
+    'feature/serial-console'
+    >>> branch_of("export DITANA_VERSION=0.9.4-Beta\\n") is None
+    True
+    """
+    found = re.search(r"^export DITANA_BRANCH=(.+)$", version_sh, re.M)
+    return found.group(1).strip() if found else None
+
+
+def mirrorlist_of(enable_sh):
+    """Which mirrorlist the installer would include in the system it builds.
+
+    >>> mirrorlist_of("Include = /etc/pacman.d/ditana-testing-mirrorlist\\n")
+    'ditana-testing-mirrorlist'
+    >>> mirrorlist_of("Include = /etc/pacman.d/ditana-mirrorlist\\n")
+    'ditana-mirrorlist'
+    >>> mirrorlist_of("nothing of the sort") is None
+    True
+    """
+    found = re.search(r"ditana(?:-testing)?-mirrorlist", enable_sh)
+    return found.group(0) if found else None
+
+
+def unfit_reasons(medium):
+    """Why a medium must not be the one this verdict is taken from.
+
+    Three ways for a run to look green while having tested something else. The
+    medium is signed only when a key was chosen, and a key is chosen for a
+    medium that gets published -- such a medium installs from the production
+    repository, so the verdict would be about packages released weeks ago. The
+    mirrorlist is the same question asked of the medium rather than of its name:
+    build.sh can apply the testing patch to profiledef.sh alone, which renames
+    the ISO to Ditana_Testing and leaves the official repository in place. And
+    the branch decides the configuration -- a main build takes the released one,
+    which is what the packages under test will meet.
+
+    Anything that cannot be read is a reason of its own. A check that could not
+    be carried out is not a check that passed.
+
+    >>> fit = {"signed": False, "mirrorlist": TESTING_MIRRORLIST, "branch": "main"}
+    >>> unfit_reasons(fit)
+    []
+    >>> unfit_reasons({**fit, "signed": True})
+    ['it is signed, so it is a medium built to be published, and it installs from the production repository']
+    >>> unfit_reasons({**fit, "mirrorlist": "ditana-mirrorlist"})
+    ['its installer enables ditana-mirrorlist, so it would install the packages that are already released']
+    >>> unfit_reasons({**fit, "mirrorlist": None})
+    ['its installer names no ditana mirrorlist, so what it would install cannot be told']
+    >>> unfit_reasons({**fit, "branch": "feature/serial-console"})
+    ["it was built from branch 'feature/serial-console', so it carries that branch's configuration and not the released one"]
+    >>> unfit_reasons({**fit, "branch": None})
+    ['it does not say which branch it was built from, so its configuration cannot be told']
+    >>> len(unfit_reasons({"signed": True, "mirrorlist": None, "branch": None}))
+    3
+    """
+    reasons = []
+    if medium["signed"]:
+        reasons.append("it is signed, so it is a medium built to be published, "
+                       "and it installs from the production repository")
+    if medium["mirrorlist"] is None:
+        reasons.append("its installer names no ditana mirrorlist, so what it "
+                       "would install cannot be told")
+    elif medium["mirrorlist"] != TESTING_MIRRORLIST:
+        reasons.append(f"its installer enables {medium['mirrorlist']}, so it "
+                       "would install the packages that are already released")
+    if medium["branch"] is None:
+        reasons.append("it does not say which branch it was built from, so its "
+                       "configuration cannot be told")
+    elif medium["branch"] != RELEASED_BRANCH:
+        reasons.append(f"it was built from branch {medium['branch']!r}, so it "
+                       "carries that branch's configuration and not the "
+                       "released one")
+    return reasons
+
+
+def _xorriso(iso, *args):
+    return subprocess.run(["xorriso", "-indev", iso, *args],
+                          capture_output=True, text=True).stdout
+
+
+def _from_rootfs(iso, offset, path):
+    return subprocess.run(["unsquashfs", "-o", str(offset), "-cat", iso, path],
+                          capture_output=True, text=True).stdout
+
+
+def read_medium(iso):
+    """What the medium says about itself, read without unpacking it.
+
+    The two files that settle this live inside the rootfs image, and the rootfs
+    image lives inside the ISO. Neither has to be extracted: xorriso reports the
+    block the image starts at, and unsquashfs reads a filesystem at an offset --
+    so a few kilobytes of a 1.9 GB file are what gets read.
+
+    Raises ValueError when the ISO carries no rootfs image at all, which is not
+    an unfit medium but something that is not an installation medium.
+    """
+    report = _xorriso(iso, "-find", "/", "-name", ROOTFS_IMAGE,
+                      "-exec", "report_lba", "--")
+    block = startlba(report)
+    if block is None:
+        raise ValueError(f"{iso} carries no {ROOTFS_IMAGE}, so it is not an "
+                         f"installation medium built by mkarchiso")
+    offset = block * ISO_BLOCK
+    return {
+        "signed": ROOTFS_SIGNATURE in _xorriso(iso, "-find", "/",
+                                               "-name", ROOTFS_SIGNATURE),
+        "mirrorlist": mirrorlist_of(_from_rootfs(iso, offset, ENABLE_FILE)),
+        "branch": branch_of(_from_rootfs(iso, offset, VERSION_FILE)),
+    }
+
+
+def progress(work_dir):
+    """What the harness recorded about how far it got.
+
+    Written line by line while it happened, so a run that was killed leaves
+    the same answer as one that finished. Absent entirely if the harness died
+    before starting the guest, which is itself the answer: nothing was
+    installed.
+
+    >>> progress("/nonexistent")
+    {}
+    """
+    path = os.path.join(work_dir, "progress")
+    if not os.path.exists(path):
+        return {}
+    fields = {}
+    with open(path) as fh:
+        for line in fh:
+            key, _, value = line.strip().partition(" ")
+            if key:
+                fields[key] = value
+    return fields
+
+
+def keep_screenshot(work_dir, records, stem):
+    """Put the screen of a failed installation where the dashboard can link it.
+
+    The harness photographs the guest at the moment it gives up, and that
+    picture is the only thing that shows an installer sitting at a dialog --
+    the serial log falls silent once the medium's bootloader hands over, so
+    every explanation is on the screen and nowhere else. It lived in the work
+    directory, which the next run deletes, so nobody outside the build host
+    ever saw one.
+
+    Under logs/<stem>/ like everything else, which is what makes it disappear
+    with the run when the rolling index drops it.
+    """
+    for name in ("screen.png", "screen.ppm"):
+        source = os.path.join(work_dir, name)
+        if not os.path.exists(source):
+            continue
+        dest_dir = os.path.join(records, "logs", stem, "test-install")
+        os.makedirs(dest_dir, exist_ok=True)
+        # Ditana's umask is 027, and the web server cannot traverse a directory
+        # it may not read -- the same reason capture_logs() chmods every level.
+        for level in (os.path.join(records, "logs"),
+                      os.path.join(records, "logs", stem), dest_dir):
+            os.chmod(level, 0o755)
+        dest = os.path.join(dest_dir, name)
+        shutil.copyfile(source, dest)
+        os.chmod(dest, 0o644)
+        return f"logs/{stem}/test-install/{name}"
+    return None
+
+
+def newest_run(records):
+    """The run this test belongs to: the one the pipeline wrote last."""
+    index_path = os.path.join(records, "index.json")
+    if not os.path.exists(index_path):
+        return None
+    with open(index_path) as fh:
+        runs = json.load(fh).get("runs", [])
+    return runs[0] if runs else None
+
+
+def load_publish():
+    """Import publish-ditana-build, which has no .py extension.
+
+    For its record keeping and for nothing else. The verdict below used to be
+    written by a copy of that code living here, and the copy wrote the record
+    without publishing it -- so the page that exists to show the verdict never
+    saw one.
+    """
+    path = os.path.join(HERE, "publish-ditana-build")
+    loader = importlib.machinery.SourceFileLoader("ditana_publish", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Install the testing repository in QEMU and record the result")
+    parser.add_argument("--packages", default=DEFAULT_PACKAGES,
+                        help=f"package tree holding build-runs (default: {DEFAULT_PACKAGES})")
+    parser.add_argument("--iso", default=None,
+                        help="testing ISO (default: the newest in ~/ditana-installer/out)")
+    parser.add_argument("--answer-file", default=DEFAULT_ANSWER_FILE,
+                        help=f"answer file to install with (default: {DEFAULT_ANSWER_FILE})")
+    parser.add_argument("--work-dir", default=DEFAULT_WORK_DIR,
+                        help=f"where the harness builds the guest "
+                             f"(default: {DEFAULT_WORK_DIR})")
+    args = parser.parse_args()
+
+    records = os.path.join(args.packages, "build-runs")
+    run = newest_run(records)
+    if run is None:
+        print(f"No run records in {records}; nothing to record a verdict on.")
+        return 1
+
+    iso = args.iso
+    if iso is None:
+        candidates = sorted(glob.glob(DEFAULT_ISO_GLOB), key=os.path.getmtime)
+        if not candidates:
+            print(f"No ISO found in {DEFAULT_ISO_GLOB}. Build one first: "
+                  f"ditana-installer/build.sh")
+            return 1
+        iso = candidates[-1]
+
+    # Fail closed, the way the review gate does: the newest ISO in that
+    # directory is whatever was built last, and nothing but this says whether it
+    # is the medium the question needs.
+    try:
+        unfit = unfit_reasons(read_medium(iso))
+    except ValueError as problem:
+        print(f"Refusing to test: {problem}")
+        return 1
+    if unfit:
+        print(f"Refusing to test with {os.path.basename(iso)}. It cannot answer "
+              f"the question this run asks:")
+        for reason in unfit:
+            print(f"  - {reason}")
+        print("docs/testing-medium.md says what the medium has to be, and how "
+              "to build one.")
+        return 1
+
+    print(f"--- Testing run {run['file']} with {os.path.basename(iso)}")
+    # stdout is left alone so that the journal shows the run as it happens --
+    # this takes the better part of an hour, and a job that says nothing for
+    # that long is indistinguishable from a wedged one. Only stderr is
+    # captured, which is where the harness says what went wrong.
+    proc = subprocess.run([HARNESS, iso, args.answer_file, args.work_dir],
+                          stderr=subprocess.PIPE, text=True)
+    sys.stderr.write(proc.stderr)
+
+    passed = proc.returncode == 0
+    reached = progress(args.work_dir)
+    verdict = {
+        "result": "passed" if passed else "failed",
+        "finished": datetime.datetime.now(datetime.timezone.utc)
+                            .isoformat(timespec="seconds"),
+        "iso": os.path.basename(iso),
+        "answer-file": os.path.basename(args.answer_file),
+        # How far it got, not only whether it got there. "installed" with a
+        # failed result is a system that was written correctly and does not
+        # come up, which is a different bug from one that never installed.
+        "stage": reached.get("stage", "starting"),
+    }
+    for key in ("install-seconds", "boot-seconds"):
+        if key in reached:
+            try:
+                verdict[key] = int(reached[key])
+            except ValueError:
+                pass
+    if not passed:
+        # The harness stops at the first thing that went wrong and names it
+        # there, so the last line of stderr is the closest thing to a reason
+        # there is. Only on a failure: a passing run also writes to stderr --
+        # qemu says "terminating on signal 15" when the banner has arrived and
+        # it is shut down -- and a green record carrying that line reads like
+        # something went wrong.
+        detail = (proc.stderr.strip().splitlines() or [""])[-1]
+        verdict["detail"] = detail[:500]
+        screenshot = keep_screenshot(args.work_dir, records,
+                                     os.path.splitext(run["file"])[0])
+        if screenshot:
+            verdict["screenshot"] = screenshot
+    # Both the run's own file and the rolling index, because the dashboard
+    # reads the index and the release check reads the record, and a verdict
+    # visible to only one of them is worse than none: the page would show a
+    # state the gate does not act on, or the other way round.
+    load_publish().publish_run_record(args.packages, **{"test-install": verdict})
+    print(f"--- Recorded on {run['file']}: test installation {verdict['result']}")
+
+    # The exit code follows the verdict, so that whatever runs this can tell
+    # without reading the record.
+    return 0 if proc.returncode == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

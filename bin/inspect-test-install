@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Open the disk a test installation wrote, so its log can be read, and close
+# it again afterwards.
+#
+#     inspect-test-install open  [work-dir]
+#     inspect-test-install close [work-dir]
+#
+# After `open`, the installed system is at /mnt/ditana-test-install; its
+# installer log is var/log/install_ditana.log under there. `close` takes it
+# apart again.
+#
+# This exists because the order matters and getting it wrong is expensive.
+# Disconnecting the network block device while the pool is still imported
+# leaves the pool SUSPENDED: it cannot then be exported, cleared or destroyed,
+# and only a reboot of the build host gets rid of it. That happened twice on
+# the same evening, both times by hand, which is why it is a script now and
+# not a note.
+
+set -euo pipefail
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+ACTION=${1:-}
+WORK_DIR=${2:-/var/tmp/ditana-test-install}
+DISK=$WORK_DIR/root.qcow2
+NBD=${DITANA_INSPECT_NBD:-/dev/nbd0}
+POOL=ditana-root
+MOUNT=/mnt/ditana-test-install
+
+[[ $EUID -eq 0 ]] || exec sudo -- "$0" "$@"
+
+case $ACTION in
+open)
+    [[ -f $DISK ]] || die "$DISK does not exist"
+    zpool list "$POOL" >/dev/null 2>&1 && die "$POOL is already imported; run '${0##*/} close' first"
+
+    modprobe nbd max_part=16
+    qemu-nbd --connect="$NBD" --read-only -f qcow2 "$DISK"
+
+    # udev needs a moment to publish the partitions before ZFS can find the
+    # pool on one of them.
+    for _ in $(seq 1 20); do
+        [[ -b ${NBD}p3 ]] && break
+        sleep 1
+    done
+    [[ -b ${NBD}p3 ]] || { qemu-nbd --disconnect "$NBD" >/dev/null; die "${NBD}p3 never appeared; is $DISK a finished installation?"; }
+
+    # Read-only throughout: this is a post-mortem, and a pool that a test
+    # installation may still be booted from is not one to write to.
+    zpool import -o readonly=on -f -R "$MOUNT" -d "${NBD}p3" "$POOL"
+    zfs mount "$POOL/ROOT/default"
+    zfs mount "$POOL/HOME/default" 2>/dev/null || true
+
+    echo "$MOUNT holds the installed system."
+    echo "Its installer log: $MOUNT/var/log/install_ditana.log"
+    echo "Close it again with: ${0##*/} close"
+    ;;
+close)
+    # Every step before the disconnect, and the disconnect last. Anything else
+    # is the suspended pool this script exists to prevent.
+    if zpool list "$POOL" >/dev/null 2>&1; then
+        # umount -R and never `zfs unmount -a`. Two reasons, and the second is
+        # the serious one: -R unmounts the nested datasets before the one they
+        # sit inside, which plain export does not manage on its own; and `-a`
+        # means every mounted dataset on the machine, including the live
+        # system's own on a host whose root is ZFS.
+        umount -R "$MOUNT" 2>/dev/null || true
+        zpool export "$POOL" || die "$POOL would not export; something is still using $MOUNT. Do not disconnect $NBD until it does."
+    fi
+    qemu-nbd --disconnect "$NBD" >/dev/null 2>&1 || true
+    rmdir "$MOUNT" 2>/dev/null || true
+    echo "Closed."
+    ;;
+*)
+    die "usage: ${0##*/} open|close [work-dir]"
+    ;;
+esac

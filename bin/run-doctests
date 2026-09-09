@@ -1,0 +1,59 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Run the doctests carried by the pipeline scripts.
+
+The scripts have no .py extension, so `python -m doctest` reads them as text
+files instead of importing them and then complains about the indentation of
+the first docstring it meets. Loading them the way publish-ditana-build loads
+the pipeline avoids that, and gives one command for all of them.
+
+The heavier suites stay separate, because they are a different kind of thing:
+pkgbuild-review-gate-test builds git repositories and replays a year of real
+history. What belongs here is the arithmetic and the decisions -- the parts
+where the interesting cases are cheap to write down next to the code they
+describe.
+
+Run:  ./run-doctests
+"""
+
+import doctest
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+SCRIPTS = [
+    "publish-ditana-build",
+    "ditana-test-install",
+    "build-ditana-packages",
+    "release-after-test",
+]
+
+
+def load(name):
+    path = os.path.join(HERE, name)
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main():
+    failed = total = 0
+    for name in SCRIPTS:
+        result = doctest.testmod(load(name), verbose=False)
+        print(f"{name}: {result.attempted - result.failed}/{result.attempted} passed")
+        failed += result.failed
+        total += result.attempted
+    if not total:
+        print("No doctests found at all, which is not a pass.")
+        return 1
+    print(f"--- {total - failed} of {total} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# What the units need from the host they are installed on.
+#
+# The units name their tools by absolute path, and those tools belong to a
+# different package than this repository. When that package moved them from
+# /usr/local/bin to /usr/bin, the nightly build stopped starting at all: systemd
+# reported status 203 and wrote no run record, so the dashboard went on showing
+# the previous night as if nothing had happened. Nothing in this repository
+# changed, which is why nothing here noticed.
+#
+# systemd-analyze verify asks the question the way systemd itself will, against
+# the executables of the machine it runs on. That makes the check meaningful only
+# on a host that runs these units, and it says so where it skips.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+UNITS=$HERE/../systemd
+[[ -d $UNITS ]] || { echo "FAIL: $UNITS is missing"; exit 1; }
+
+pass=0; fail=0
+ok() { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no() { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+skip() { printf '  skip %s\n' "$1"; }
+
+echo "the lock directory:"
+# A RuntimeDirectory= of the same name in a unit that runs as root hands the
+# directory back to root with mode 0755 at every start, and every job that is not
+# root can no longer take the lock.
+if grep -rqs '^RuntimeDirectory=ditana-maintenance' "$UNITS"; then
+    no "a unit declares the lock directory itself"
+else
+    ok "no unit declares the lock directory itself"
+fi
+
+echo
+echo "the notifier:"
+notifier=$(python - "$HERE/build-ditana-packages" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("pipeline", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+print(module.DITANA_NOTIFY)
+PY
+)
+installed=$(command -v ditana-notify || true)
+if [[ -z $installed ]]; then
+    skip "ditana-notify is not installed here, so there is nothing to compare with"
+elif [[ $notifier == "$installed" ]]; then
+    ok "the pipeline calls ditana-notify where this host has it ($installed)"
+else
+    no "the pipeline calls $notifier, and this host has ditana-notify at $installed"
+fi
+
+echo
+echo "the units, as systemd will read them:"
+if [[ ! -e /etc/systemd/system/ditana-package-build.service ]]; then
+    skip "the units are not installed on this host, so no executable of theirs is expected here"
+elif ! command -v systemd-analyze >/dev/null; then
+    skip "systemd-analyze is not installed"
+else
+    work=$(mktemp -d) || { echo "FAIL: no temporary directory"; exit 1; }
+    trap 'rm -rf "$work"' EXIT
+    cp -r "$UNITS/." "$work/"
+    report=$(SYSTEMD_UNIT_PATH="$work:" systemd-analyze verify \
+        "$work/ditana-package-build.service" "$work/ditana-package-build.timer" 2>&1)
+    status=$?
+    if [[ $status -eq 0 && -z $report ]]; then
+        ok "the service, its drop-in and the timer name only what this host has"
+    else
+        no "systemd-analyze verify objects (exit $status):"
+        printf '    %s\n' "$report"
+    fi
+fi
+
+echo
+echo "--- $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

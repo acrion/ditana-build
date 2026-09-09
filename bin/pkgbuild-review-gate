@@ -1,0 +1,1218 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Classify the change a `git pull` brought into a package directory.
+
+Ditana rebuilds third-party AUR PKGBUILDs into a repository its users trust via
+pacman's SigLevel. A malicious commit to one of those PKGBUILDs would therefore
+be signed and shipped without anybody looking at it. This gate looks at it.
+
+The verdict is binary, because the repository is published all-or-nothing:
+either the change is one of the few shapes that are safe by construction
+(version bumps, comments, whitespace, optdepends prose), or the run stops and a
+human decides.
+
+The gate deliberately never sources the PKGBUILD. Sourcing runs the top level of
+an untrusted shell script, which is precisely the code an attacker controls, so
+everything here is derived from a static scan. Where the scan cannot make sense
+of the file, the gate fails closed.
+
+What it does NOT do: review upstream source code. It reviews packaging metadata.
+For -git packages the upstream commit that gets compiled is unreviewed by design.
+
+Exit codes:
+    0   pass  - the change is safe by construction, the build may continue
+    2   abort - a human has to look at this
+    1   error - the gate itself could not decide (also a reason to stop)
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+# ---------------------------------------------------------------------------
+# Quote-aware scanner
+# ---------------------------------------------------------------------------
+
+# Context classes assigned to every character of a PKGBUILD. Structure parsing
+# only ever looks at CODE characters, so a brace inside a string or a `#` inside
+# a here-document cannot be mistaken for syntax.
+CODE = 0
+STRING = 1
+COMMENT = 2
+
+
+class ScanError(Exception):
+    """The file could not be scanned with confidence."""
+
+
+def scan(text):
+    """Classify every character of `text` as CODE, STRING or COMMENT.
+
+    Returns a bytearray of the same length as `text`.
+
+    Handles single quotes, double quotes, $'...' and $"..." quoting, command
+    substitution nested inside double quotes, backslash escapes, comments and
+    here-documents. Here-documents matter: their body is data, not commentary,
+    and a `#` inside one must not blank out the rest of the line.
+    """
+    mask = bytearray(len(text))
+    # Stack of open contexts. 'dq' and 'sq' are quotes, 'cmd' is $(...) or a
+    # backtick, which re-enters ordinary parsing even inside double quotes.
+    stack = []
+    # Here-documents are queued when their `<<WORD` is seen and consumed at the
+    # start of the next line.
+    pending_heredocs = []
+    i = 0
+    n = len(text)
+
+    def in_quote():
+        return bool(stack) and stack[-1] in ("dq", "sq")
+
+    while i < n:
+        # A queued here-document starts after the newline that ended the line
+        # introducing it.
+        if pending_heredocs and (i == 0 or text[i - 1] == "\n"):
+            delim, strip_tabs = pending_heredocs.pop(0)
+            end = _heredoc_end(text, i, delim, strip_tabs)
+            for k in range(i, end):
+                mask[k] = STRING
+            i = end
+            continue
+
+        c = text[i]
+        ctx = stack[-1] if stack else None
+
+        if ctx == "sq":
+            mask[i] = STRING
+            if c == "'":
+                stack.pop()
+            i += 1
+            continue
+
+        if ctx == "ansi":
+            mask[i] = STRING
+            if c == "\\" and i + 1 < n:
+                mask[i + 1] = STRING
+                i += 2
+                continue
+            if c == "'":
+                stack.pop()
+            i += 1
+            continue
+
+        # Ordinary context, double quotes and command substitution share the
+        # rest of the logic; they differ only in what terminates them.
+        if c == "\\" and i + 1 < n and ctx != "sq":
+            mask[i] = STRING if in_quote() else CODE
+            mask[i + 1] = mask[i]
+            i += 2
+            continue
+
+        if ctx == "dq":
+            if c == '"':
+                mask[i] = STRING
+                stack.pop()
+                i += 1
+                continue
+            if c == "$" and i + 1 < n and text[i + 1] == "(":
+                mask[i] = mask[i + 1] = STRING
+                stack.append("cmd")
+                i += 2
+                continue
+            mask[i] = STRING
+            i += 1
+            continue
+
+        # ctx is None (top level) or 'cmd' (inside a command substitution).
+        if c == "#" and (i == 0 or text[i - 1] in " \t\n;&|(") :
+            # bash only starts a comment at the beginning of a word.
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                mask[k] = COMMENT
+            i = j
+            continue
+
+        if c == "'":
+            mask[i] = STRING
+            stack.append("sq")
+            i += 1
+            continue
+
+        if c == '"':
+            mask[i] = STRING
+            stack.append("dq")
+            i += 1
+            continue
+
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            mask[i] = mask[i + 1] = STRING
+            stack.append("ansi")
+            i += 2
+            continue
+
+        if c == "$" and i + 1 < n and text[i + 1] == '"':
+            mask[i] = mask[i + 1] = STRING
+            stack.append("dq")
+            i += 2
+            continue
+
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            mask[i] = mask[i + 1] = CODE
+            stack.append("cmd")
+            i += 2
+            continue
+
+        if c == ")" and ctx == "cmd":
+            mask[i] = CODE
+            stack.pop()
+            i += 1
+            continue
+
+        if c == "`":
+            # Backticks are treated as an opaque string; nesting rules inside
+            # them are baroque and they are vanishingly rare in a PKGBUILD.
+            j = i + 1
+            while j < n and text[j] != "`":
+                if text[j] == "\\":
+                    j += 1
+                j += 1
+            if j >= n:
+                raise ScanError("unterminated backtick command substitution")
+            for k in range(i, j + 1):
+                mask[k] = STRING
+            i = j + 1
+            continue
+
+        if c == "<" and text.startswith("<<<", i):
+            # A here-string, not a here-document: it has no body to skip, and
+            # its `<<` must not be re-examined on the next character.
+            mask[i] = mask[i + 1] = mask[i + 2] = CODE
+            i += 3
+            continue
+
+        if c == "<" and text.startswith("<<", i):
+            mask[i] = CODE
+            consumed, spec = _heredoc_intro(text, i)
+            if spec is not None:
+                pending_heredocs.append(spec)
+                for k in range(i, i + consumed):
+                    mask[k] = CODE
+                i += consumed
+                continue
+
+        mask[i] = CODE
+        i += 1
+
+    if stack:
+        raise ScanError(f"unterminated {stack[-1]} at end of file")
+    return mask
+
+
+def _heredoc_intro(text, i):
+    """Parse a `<<WORD` / `<<-WORD` / `<<"WORD"` introduction at position `i`.
+
+    Returns (characters consumed, (delimiter, strip_tabs)) or (0, None) if this
+    is a `<<<` here-string or otherwise not a here-document.
+    """
+    j = i + 2
+    if j < len(text) and text[j] == "<":
+        return 0, None  # here-string, no body to skip
+    strip_tabs = False
+    if j < len(text) and text[j] == "-":
+        strip_tabs = True
+        j += 1
+    while j < len(text) and text[j] in " \t":
+        j += 1
+    m = re.match(r"""(?:"([^"]*)"|'([^']*)'|([A-Za-z_][\w.-]*))""", text[j:])
+    if not m:
+        return 0, None
+    delim = m.group(1) or m.group(2) or m.group(3)
+    return (j - i) + m.end(), (delim, strip_tabs)
+
+
+def _heredoc_end(text, start, delim, strip_tabs):
+    """Return the offset just past the terminating line of a here-document."""
+    pos = start
+    while pos < len(text):
+        eol = text.find("\n", pos)
+        eol = len(text) if eol < 0 else eol
+        line = text[pos:eol]
+        if (line.lstrip("\t") if strip_tabs else line).strip() == delim:
+            return min(eol + 1, len(text))
+        pos = eol + 1
+    raise ScanError(f"unterminated here-document <<{delim}")
+
+
+# ---------------------------------------------------------------------------
+# PKGBUILD structure
+# ---------------------------------------------------------------------------
+
+_FUNC_RE = re.compile(r"(?:function[ \t]+)?([A-Za-z_][\w+.@-]*)[ \t]*\([ \t]*\)[ \t\n]*")
+_ASSIGN_RE = re.compile(r"([A-Za-z_]\w*)(\+?)=")
+
+
+class PkgBuild:
+    """A statically parsed PKGBUILD.
+
+    `scalars` and `arrays` hold raw (unexpanded) values, `functions` holds
+    normalised function bodies, `statements` holds every top-level command --
+    code that runs the moment makepkg sources the file -- and `comments` holds
+    the comment lines, which is where the maintainer is recorded.
+    """
+
+    def __init__(self, text, path="PKGBUILD"):
+        self.path = path
+        self.text = text
+        self.mask = scan(text)
+        self.scalars = {}
+        self.arrays = {}
+        self.functions = {}
+        self.statements = []
+        self.comments = []
+        self._parse()
+
+    # -- parsing ----------------------------------------------------------
+
+    def _is_code(self, i):
+        return self.mask[i] == CODE
+
+    def _skip_separators(self, i):
+        while i < len(self.text):
+            if self.mask[i] == COMMENT:
+                i += 1
+                continue
+            if self.mask[i] == CODE and self.text[i] in " \t\n;\r":
+                i += 1
+                continue
+            break
+        return i
+
+    def _match_at(self, regex, i):
+        """Match `regex` at position `i`, but only across CODE characters."""
+        m = regex.match(self.text, i)
+        if not m:
+            return None
+        if any(self.mask[k] != CODE for k in range(m.start(), m.end())):
+            return None
+        return m
+
+    def _find_matching(self, i, open_ch, close_ch):
+        """Return the index of the CODE `close_ch` matching the one at `i`."""
+        depth = 0
+        k = i
+        while k < len(self.text):
+            if self.mask[k] == CODE:
+                if self.text[k] == open_ch:
+                    depth += 1
+                elif self.text[k] == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return k
+            k += 1
+        raise ScanError(f"unbalanced {open_ch!r} at offset {i}")
+
+    def _end_of_statement(self, i):
+        """Consume one top-level command, honouring grouping and continuations."""
+        depth = 0
+        k = i
+        while k < len(self.text):
+            c = self.text[k]
+            if self.mask[k] == CODE:
+                if c in "({[":
+                    depth += 1
+                elif c in ")}]":
+                    depth -= 1
+                elif depth == 0 and c in "\n;":
+                    return k
+            k += 1
+        return len(self.text)
+
+    def _parse(self):
+        for line_no, line in enumerate(self.text.splitlines(), 1):
+            pass  # line numbers are recovered lazily below
+
+        i = 0
+        n = len(self.text)
+        while i < n:
+            i = self._skip_separators(i)
+            if i >= n:
+                break
+
+            m = self._match_at(_FUNC_RE, i)
+            if m and m.end() < n and self.text[m.end()] in "{(" and self._is_code(m.end()):
+                name = m.group(1)
+                open_ch = self.text[m.end()]
+                close_ch = "}" if open_ch == "{" else ")"
+                end = self._find_matching(m.end(), open_ch, close_ch)
+                body = self.text[m.end() + 1:end]
+                body_mask = self.mask[m.end() + 1:end]
+                # bash lets a function be redefined and keeps the last one.
+                # niri-git really does declare pkgver() twice, so refusing to
+                # parse that would block the package for good; instead the
+                # definitions are kept in order and a *change* in how often a
+                # name is defined becomes a finding of its own, because
+                # shadowing an already reviewed function is an evasion trick.
+                self.functions.setdefault(name, []).append(
+                    normalise_code(body, body_mask))
+                i = end + 1
+                continue
+
+            m = self._match_at(_ASSIGN_RE, i)
+            if m:
+                name, append = m.group(1), m.group(2) == "+"
+                j = m.end()
+                if j < n and self.text[j] == "(" and self._is_code(j):
+                    end = self._find_matching(j, "(", ")")
+                    elements = split_words(self.text[j + 1:end], self.mask[j + 1:end])
+                    if append and name in self.arrays:
+                        self.arrays[name] = self.arrays[name] + elements
+                    else:
+                        self.arrays[name] = elements
+                    i = end + 1
+                else:
+                    end = self._end_of_word(j)
+                    value = unquote(self.text[j:end], self.mask[j:end])
+                    if append and name in self.scalars:
+                        self.scalars[name] = self.scalars[name] + value
+                    else:
+                        self.scalars[name] = value
+                    i = end
+                continue
+
+            end = self._end_of_statement(i)
+            stmt = normalise_code(self.text[i:end], self.mask[i:end])
+            if stmt:
+                self.statements.append(stmt)
+            i = end + 1
+
+        self.comments = [
+            "".join(
+                self.text[k]
+                for k in range(start, stop)
+            ).strip()
+            for start, stop in self._comment_spans()
+        ]
+
+    def _end_of_word(self, i):
+        k = i
+        while k < len(self.text):
+            if self.mask[k] == CODE and self.text[k] in " \t\n;&|<>":
+                return k
+            if self.mask[k] == COMMENT:
+                return k
+            k += 1
+        return len(self.text)
+
+    def _comment_spans(self):
+        spans = []
+        k = 0
+        while k < len(self.mask):
+            if self.mask[k] == COMMENT:
+                start = k
+                while k < len(self.mask) and self.mask[k] == COMMENT:
+                    k += 1
+                spans.append((start, k))
+            else:
+                k += 1
+        return spans
+
+    # -- derived views ----------------------------------------------------
+
+    def expand(self, value, _depth=0):
+        """Substitute the scalars this file defines, as far as statically possible.
+
+        Supports the parameter expansions PKGBUILDs actually use -- suffix and
+        prefix removal and substitution -- because `provides=("${pkgname%-git}")`
+        and a literal `provides=("auracle")` must compare equal. Unknown
+        variables and anything involving command substitution are left
+        untouched; callers treat a residual `$` as "cannot verify".
+        """
+        if _depth > 8 or "$" not in value:
+            return value
+        out = re.sub(
+            r"\$\{([A-Za-z_]\w*)(%%|##|%|#|//|/|\^\^|,,)?([^{}]*)\}|\$([A-Za-z_]\w*)",
+            self._expand_one,
+            value,
+        )
+        return out if out == value else self.expand(out, _depth + 1)
+
+    def _expand_one(self, m):
+        name = m.group(1) or m.group(4)
+        if name not in self.scalars:
+            return m.group(0)
+        value = self.scalars[name]
+        op, arg = m.group(2), m.group(3) or ""
+        if not op:
+            return value
+        if op in ("%", "%%"):
+            return re.sub(_glob_to_regex(arg, anchor_end=True, greedy=op == "%%"), "", value)
+        if op in ("#", "##"):
+            return re.sub(_glob_to_regex(arg, anchor_end=False, greedy=op == "##"), "", value)
+        if op in ("/", "//"):
+            old, _, new = arg.partition("/")
+            return value.replace(old, new, -1 if op == "//" else 1)
+        if op == "^^":
+            return value.upper()
+        if op == ",,":
+            return value.lower()
+        return m.group(0)
+
+    def expanded_array(self, name):
+        return [self.expand(v) for v in self.arrays.get(name, [])]
+
+    def checksum_arrays(self):
+        return {k: v for k, v in self.arrays.items() if re.match(r"^(md5|sha1|sha224|sha256|sha384|sha512|b2)sums(_.+)?$", k)}
+
+    def source_arrays(self):
+        return {k: v for k, v in self.arrays.items() if k == "source" or k.startswith("source_")}
+
+    def dependency_arrays(self):
+        return {
+            k: v
+            for k, v in self.arrays.items()
+            if re.match(r"^(depends|makedepends|checkdepends)(_.+)?$", k)
+        }
+
+    def maintainers(self):
+        out = []
+        for c in self.comments:
+            m = re.match(r"^#\s*maintainers?\s*:(.*)$", c, re.IGNORECASE)
+            if m:
+                out.append(m.group(1).strip())
+        return out
+
+    def code_only(self):
+        """The file with comments removed -- what actually executes."""
+        return "".join(
+            self.text[k] if self.mask[k] != COMMENT else " " for k in range(len(self.text))
+        )
+
+
+def _glob_to_regex(pattern, anchor_end, greedy):
+    """Translate a shell glob used in ${var%pat} / ${var#pat} into a regex."""
+    body = "".join(
+        ".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern
+    )
+    if not greedy:
+        body = body.replace(".*", ".*?")
+    return f"(?:{body})$" if anchor_end else f"^(?:{body})"
+
+
+def normalise_code(text, mask):
+    """Drop comments and collapse whitespace, so that reformatting is not a change.
+
+    Comments are removed rather than compared because a comment cannot execute;
+    whitespace is collapsed only outside strings, so a changed string literal
+    still shows up.
+    """
+    out = []
+    for k in range(len(text)):
+        if mask[k] == COMMENT:
+            out.append(" ")
+        else:
+            out.append(text[k])
+    s = "".join(out)
+    # Collapse runs of whitespace that are not inside a string.
+    result = []
+    k = 0
+    while k < len(s):
+        if mask[k] != STRING and s[k] in " \t\n\r":
+            while k < len(s) and mask[k] != STRING and s[k] in " \t\n\r":
+                k += 1
+            result.append(" ")
+            continue
+        result.append(s[k])
+        k += 1
+    return "".join(result).strip()
+
+
+def split_words(text, mask):
+    """Split an array body into elements, honouring quoting."""
+    words = []
+    cur_start = None
+    k = 0
+    while k < len(text):
+        if mask[k] == COMMENT:
+            k += 1
+            continue
+        if mask[k] == CODE and text[k] in " \t\n\r":
+            if cur_start is not None:
+                words.append(unquote(text[cur_start:k], mask[cur_start:k]))
+                cur_start = None
+            k += 1
+            continue
+        if cur_start is None:
+            cur_start = k
+        k += 1
+    if cur_start is not None:
+        words.append(unquote(text[cur_start:], mask[cur_start:]))
+    return words
+
+
+def unquote(text, mask):
+    """Remove the quoting characters, keeping the quoted content."""
+    out = []
+    k = 0
+    while k < len(text):
+        c = text[k]
+        if mask[k] == COMMENT:
+            k += 1
+            continue
+        if c in ("'", '"') and mask[k] == STRING:
+            # A quote character that is itself part of the string context is a
+            # delimiter; content characters keep their own mask value.
+            nxt = mask[k + 1] if k + 1 < len(text) else None
+            prv = mask[k - 1] if k > 0 else None
+            if nxt != STRING or prv != STRING:
+                k += 1
+                continue
+        if c == "\\" and k + 1 < len(text):
+            out.append(text[k + 1])
+            k += 2
+            continue
+        out.append(c)
+        k += 1
+    return "".join(out).strip()
+
+
+# ---------------------------------------------------------------------------
+# Findings
+# ---------------------------------------------------------------------------
+
+class Finding:
+    def __init__(self, rule, detail):
+        self.rule = rule
+        self.detail = detail
+
+    def as_dict(self):
+        return {"rule": self.rule, "detail": self.detail}
+
+    def __str__(self):
+        return f"{self.rule}: {self.detail}"
+
+
+# Names whose value may change as part of an ordinary version bump. A source
+# URL that differs only by the substitution of one of these is not a source
+# change. `_commit`, `_tag` and friends are deliberately absent: a moved VCS
+# revision is exactly what the gate exists to surface. `pkgrel` and `epoch` are
+# absent too, and must stay absent: they are short numbers, and substituting
+# them would rewrite every matching digit of a commit hash.
+VERSION_VARS = ("pkgver", "_pkgver", "_version", "_ver")
+
+# Shortest value that may be used as a substitution literal. Below this a value
+# is not distinctive enough to replace blindly inside a URL.
+MIN_SUBSTITUTABLE = 4
+
+# Variables that reach into other packages' namespace on the user's system.
+# A repository can hijack an unrelated package through these, so they are held
+# to the same standard as source= even though a bump never touches them.
+NAMESPACE_ARRAYS = ("provides", "conflicts", "replaces", "validpgpkeys")
+
+OBFUSCATION_PATTERNS = [
+    ("base64", re.compile(r"\bbase(64|32)\b")),
+    ("eval", re.compile(r"(^|[\s;&|(])eval[\s(]")),
+    ("pipe-to-shell", re.compile(r"\b(curl|wget|fetch)\b[^|;&\n]*\|[^|\n]*\b(ba|z|k|da)?sh\b")),
+    ("hex-escape", re.compile(r"\\x[0-9a-fA-F]{2}")),
+    ("hex-decode", re.compile(r"\b(xxd|uudecode|openssl\s+enc)\b")),
+]
+
+
+def version_placeholders(old, new):
+    """Build substitution tables that neutralise an ordinary version bump.
+
+    Returns (old_subs, new_subs): value -> placeholder, applied to the
+    respective side before comparing source URLs and file names.
+    """
+    old_subs, new_subs = {}, {}
+    for name in VERSION_VARS:
+        o = old.expand(old.scalars.get(name, ""))
+        n = new.expand(new.scalars.get(name, ""))
+        if not o or not n or o == n:
+            continue
+        # Only version-shaped values are neutralised, so that a helper variable
+        # cannot be repurposed to smuggle a changed URL past the comparison.
+        if not (re.match(r"^v?\d", o) and re.match(r"^v?\d", n)):
+            continue
+        if len(o) < MIN_SUBSTITUTABLE or len(n) < MIN_SUBSTITUTABLE:
+            continue
+        old_subs[o] = f"<{name}>"
+        new_subs[n] = f"<{name}>"
+    return old_subs, new_subs
+
+
+def apply_subs(value, subs):
+    for literal, placeholder in sorted(subs.items(), key=lambda kv: -len(kv[0])):
+        value = value.replace(literal, placeholder)
+    return value
+
+
+def vcs_fragment(url):
+    """Return the VCS fragment of a source entry, if it has one."""
+    if "#" not in url:
+        return None
+    if not re.search(r"\b(git|hg|svn|bzr)\+|\.git\b", url):
+        return None
+    return url.split("#", 1)[1]
+
+
+# ---------------------------------------------------------------------------
+# Dependency resolution
+# ---------------------------------------------------------------------------
+
+_dep_cache = {}
+
+
+def dependency_resolvable(name):
+    """True if pacman can satisfy `name` from the configured repositories.
+
+    Uses -Sp so that virtual provides (java-runtime, sh, ...) resolve the same
+    way they will during the build.
+    """
+    if name in _dep_cache:
+        return _dep_cache[name]
+    try:
+        r = subprocess.run(
+            ["pacman", "-Sp", "--print-format", "%n", name],
+            capture_output=True, text=True, timeout=60,
+        )
+        ok = r.returncode == 0 and bool(r.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    _dep_cache[name] = ok
+    return ok
+
+
+def dep_name(entry):
+    """Strip a version constraint and a description from a dependency entry."""
+    entry = entry.split(":", 1)[0].strip()
+    return re.split(r"[<>=]", entry, maxsplit=1)[0].strip()
+
+
+# ---------------------------------------------------------------------------
+# Git access
+# ---------------------------------------------------------------------------
+
+def git(repo, *args):
+    r = subprocess.run(
+        ["git", "-C", repo, *args], capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed in {repo}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def git_ok(repo, *args):
+    return subprocess.run(
+        ["git", "-C", repo, *args], capture_output=True, text=True,
+    ).returncode == 0
+
+
+def read_blob(repo, rev, path):
+    r = subprocess.run(
+        ["git", "-C", repo, "show", f"{rev}:{path}"], capture_output=True,
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode("utf-8", errors="replace")
+
+
+def tracked_files(repo, rev):
+    return [p for p in git(repo, "ls-tree", "-r", "--name-only", rev).splitlines() if p]
+
+
+def find_pkgbuild(repo, rev):
+    """Locate the tracked PKGBUILD, mirroring what build-ditana-packages does."""
+    candidates = [p for p in tracked_files(repo, rev) if os.path.basename(p) == "PKGBUILD"]
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+# ---------------------------------------------------------------------------
+# The gate itself
+# ---------------------------------------------------------------------------
+
+def review(repo, old_rev, new_rev, check_deps=True, strict_functions=True):
+    """Compare two revisions of a package directory. Returns a list of Findings."""
+    findings = []
+
+    old_path = find_pkgbuild(repo, old_rev)
+    new_path = find_pkgbuild(repo, new_rev)
+    if new_path is None:
+        return [Finding("unparsable", f"no unique tracked PKGBUILD at {new_rev}")]
+    if old_path is None:
+        return [Finding("unparsable", f"no unique tracked PKGBUILD at {old_rev}")]
+    if old_path != new_path:
+        findings.append(Finding("pkgbuild-moved", f"{old_path} -> {new_path}"))
+
+    old_text = read_blob(repo, old_rev, old_path)
+    new_text = read_blob(repo, new_rev, new_path)
+    if old_text is None or new_text is None:
+        return [Finding("unparsable", "PKGBUILD blob unreadable")]
+
+    try:
+        old = PkgBuild(old_text, old_path)
+    except ScanError as e:
+        return [Finding("unparsable", f"old PKGBUILD: {e}")]
+    try:
+        new = PkgBuild(new_text, new_path)
+    except ScanError as e:
+        return [Finding("unparsable", f"new PKGBUILD: {e}")]
+
+    old_subs, new_subs = version_placeholders(old, new)
+    version_changed = bool(old_subs)
+
+    source_findings = _check_sources(old, new, old_subs, new_subs)
+
+    findings += _check_functions(old, new, strict_functions)
+    findings += _check_statements(old, new)
+    findings += _check_url(old, new)
+    findings += source_findings
+    findings += _check_checksums(old, new, version_changed, bool(source_findings))
+    findings += _check_namespace(old, new, old_subs, new_subs)
+    findings += _check_maintainer(old, new)
+    findings += _check_obfuscation(old, new)
+    findings += _check_install(repo, old_rev, new_rev, old, new)
+    findings += _check_local_sources(repo, old_rev, new_rev, old, new)
+    if check_deps:
+        findings += _check_dependencies(old, new)
+
+    return findings
+
+
+def _check_functions(old, new, strict):
+    findings = []
+    declared = {"prepare", "build", "check", "package"}
+    names = set(old.functions) | set(new.functions)
+    for name in sorted(names):
+        is_declared = name in declared or name.startswith("package_")
+        if not (strict or is_declared):
+            continue
+        o = old.functions.get(name, [])
+        n = new.functions.get(name, [])
+        if len(o) != len(n) and o and n:
+            findings.append(Finding(
+                "function-redefined",
+                f"{name}() is defined {len(o)} time(s) before and {len(n)} after; "
+                f"only the last definition takes effect",
+            ))
+            continue
+        # bash keeps the last definition, so that is the one that matters.
+        eff_o = o[-1] if o else None
+        eff_n = n[-1] if n else None
+        if eff_o == eff_n:
+            continue
+        if eff_o is None:
+            findings.append(Finding("function-added", f"{name}() was added"))
+        elif eff_n is None:
+            findings.append(Finding("function-removed", f"{name}() was removed"))
+        else:
+            findings.append(Finding("function-changed", f"{name}() body changed"))
+    return findings
+
+
+def _check_statements(old, new):
+    if old.statements != new.statements:
+        return [Finding(
+            "toplevel-code-changed",
+            "code outside any function changed; this runs the moment makepkg "
+            "sources the PKGBUILD",
+        )]
+    return []
+
+
+def _check_url(old, new):
+    o, n = old.expand(old.scalars.get("url", "")), new.expand(new.scalars.get("url", ""))
+    if o != n:
+        return [Finding("url-changed", f"{o!r} -> {n!r}")]
+    return []
+
+
+def _check_sources(old, new, old_subs, new_subs):
+    findings = []
+    names = set(old.source_arrays()) | set(new.source_arrays())
+    for name in sorted(names):
+        o = [apply_subs(v, old_subs) for v in old.expanded_array(name)]
+        n = [apply_subs(v, new_subs) for v in new.expanded_array(name)]
+        if o == n:
+            continue
+        frag_o = [vcs_fragment(v) for v in o]
+        frag_n = [vcs_fragment(v) for v in n]
+        if len(o) == len(n) and frag_o != frag_n:
+            for a, b in zip(frag_o, frag_n):
+                if a != b:
+                    findings.append(Finding("vcs-fragment-changed", f"{name}: {a!r} -> {b!r}"))
+        else:
+            findings.append(Finding("source-changed", f"{name}: {o!r} -> {n!r}"))
+    return findings
+
+
+def _check_checksums(old, new, version_changed, source_changed):
+    """Flag a checksum that moved while the thing it describes stayed put.
+
+    A new version brings new checksums, and so does a changed or added source
+    entry -- the latter is already reported on its own. What is left is the
+    tampering signature the gate is looking for: the same URL, the same version,
+    different bytes.
+    """
+    if version_changed or source_changed:
+        return []
+    findings = []
+    for name in sorted(set(old.checksum_arrays()) | set(new.checksum_arrays())):
+        if old.arrays.get(name, []) == new.arrays.get(name, []):
+            continue
+        findings.append(Finding(
+            "checksum-changed-without-version",
+            f"{name} changed while pkgver stayed at "
+            f"{new.expand(new.scalars.get('pkgver', '?'))!r} and source= was "
+            f"untouched; the upstream artefact was replaced in place",
+        ))
+    return findings
+
+
+def _check_namespace(old, new, old_subs, new_subs):
+    findings = []
+    for name in NAMESPACE_ARRAYS:
+        # `provides=("foo=$pkgver")` moves with every bump; that is not a
+        # namespace change, so the version is neutralised here as well.
+        o = sorted(apply_subs(v, old_subs) for v in old.expanded_array(name))
+        n = sorted(apply_subs(v, new_subs) for v in new.expanded_array(name))
+        if o != n:
+            findings.append(Finding(f"{name}-changed", f"{o!r} -> {n!r}"))
+    return findings
+
+
+def _check_maintainer(old, new):
+    o, n = old.maintainers(), new.maintainers()
+    if o == n:
+        return []
+    if any(v for v in o) and not any(v for v in n):
+        return [Finding("maintainer-emptied", f"{o!r} -> {n!r}; the package was orphaned")]
+    return [Finding("maintainer-changed", f"{o!r} -> {n!r}")]
+
+
+def _check_obfuscation(old, new):
+    findings = []
+    old_code, new_code = old.code_only(), new.code_only()
+    for label, pattern in OBFUSCATION_PATTERNS:
+        before = len(pattern.findall(old_code))
+        after = len(pattern.findall(new_code))
+        if after > before:
+            findings.append(Finding(
+                "obfuscation-marker",
+                f"{label} appears {after - before} more time(s) than before",
+            ))
+    return findings
+
+
+def _check_install(repo, old_rev, new_rev, old, new):
+    findings = []
+    o = old.expand(old.scalars.get("install", ""))
+    n = new.expand(new.scalars.get("install", ""))
+    if o != n:
+        findings.append(Finding("install-file-changed", f"install={o!r} -> install={n!r}"))
+    for f in {o, n} - {""}:
+        base = os.path.dirname(new.path)
+        path = os.path.join(base, f) if base else f
+        if read_blob(repo, old_rev, path) != read_blob(repo, new_rev, path):
+            findings.append(Finding(
+                "install-file-changed",
+                f"contents of {path} changed; this runs as root on every user's system",
+            ))
+    return findings
+
+
+def _local_source_path(entry, base):
+    """The repository path a source entry names, or None if it is not local.
+
+    makepkg treats a bare name as a file adjacent to the PKGBUILD, and a
+    file:// URL is equally local regardless of its form. Until 2026-09-08 every
+    entry holding "://" or "$" was skipped here as a remote artefact covered by
+    the checksum rules -- but a local file:// source carries a SKIP checksum,
+    because hashing a file that travels in the same commit adds nothing. Thus
+    nothing checked those files at all. Measured on ditana-userns-guard, whose
+    sources were written as file://${PWD}/...: a commit that disables the whole
+    guard passed.
+
+    A rename is stripped from the left of "::"; what matters here is where the
+    file comes from, not what it is called in $srcdir.
+    """
+    location = entry.split("::", 1)[1] if "::" in entry else entry
+
+    if location.startswith("file://"):
+        path = location[len("file://"):]
+        # Both PWD and startdir are the directory holding the PKGBUILD at the
+        # moment makepkg runs, which is the only thing either can mean here.
+        for var in ("${PWD}", "$PWD", "${startdir}", "$startdir"):
+            path = path.replace(var, base or ".")
+        if "$" in path:
+            return None
+        path = os.path.normpath(path)
+        # An absolute path reaches outside the clone and can never appear in the
+        # diff, so there is nothing to watch.
+        return None if os.path.isabs(path) else path
+
+    if "://" in location or "$" in location:
+        return None
+    return os.path.join(base, location) if base else location
+
+
+def files_compiled_into(pkg, base):
+    """Every repository path that reaches makepkg for this package.
+
+    The PKGBUILD itself, its install= file, and each local source. A README, a
+    .gitignore or a funding file never reaches makepkg, and telling them apart
+    is the same question this file already answers for the review -- so the
+    build pipeline asks it here rather than deciding a second time and
+    differently.
+    """
+    paths = {pkg.path}
+    install = pkg.scalars.get("install")
+    if install and "$" not in install:
+        paths.add(os.path.join(base, install) if base else install)
+    for name in pkg.source_arrays():
+        for entry in pkg.expanded_array(name):
+            path = _local_source_path(entry, base)
+            if path is not None:
+                paths.add(path)
+    return paths
+
+
+def _check_local_sources(repo, old_rev, new_rev, old, new):
+    """Flag changes to files that source= pulls into the build.
+
+    Only files named in source= reach makepkg. A README or a .gitignore in the
+    same repository never does, so changing one is not a build change and must
+    not stop the run.
+    """
+    base = os.path.dirname(new.path)
+    referenced = set()
+    for pkg in (old, new):
+        referenced |= files_compiled_into(pkg, base)
+    referenced -= {old.path, new.path}   # a changed PKGBUILD has its own findings
+
+    changed = sorted(
+        p for p in git(repo, "diff", "--name-only", old_rev, new_rev).splitlines()
+        if p in referenced
+    )
+    if changed:
+        return [Finding(
+            "local-source-changed",
+            f"{changed!r}; these files are compiled into the package",
+        )]
+    return []
+
+
+def _check_dependencies(old, new):
+    findings = []
+    old_deps = {dep_name(d) for arr in old.dependency_arrays().values() for d in arr}
+    for name, entries in new.dependency_arrays().items():
+        for entry in entries:
+            resolved = new.expand(entry)
+            dep = dep_name(resolved)
+            if not dep or dep in old_deps:
+                continue
+            if "$" in dep:
+                findings.append(Finding(
+                    "dependency-unverifiable",
+                    f"{name} entry {entry!r} cannot be resolved statically",
+                ))
+                continue
+            if not dependency_resolvable(dep):
+                findings.append(Finding(
+                    "dependency-unknown",
+                    f"{name} gained {dep!r}, which is in neither the Arch nor the "
+                    f"Ditana repositories",
+                ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Replay -- measure the gate against the history it will have to live with
+# ---------------------------------------------------------------------------
+
+def replay(repo, limit, check_deps, strict_functions):
+    """Classify every consecutive commit pair in `repo`. Returns a summary dict."""
+    revs = git(repo, "rev-list", "--reverse", "HEAD").split()
+    if limit:
+        revs = revs[-(limit + 1):]
+    results = []
+    for a, b in zip(revs, revs[1:]):
+        try:
+            findings = review(repo, a, b, check_deps, strict_functions)
+        except Exception as e:  # a crash is a gate failure, record it as one
+            findings = [Finding("gate-error", f"{type(e).__name__}: {e}")]
+        results.append({
+            "old": a[:8], "new": b[:8],
+            "subject": git(repo, "log", "-1", "--format=%s", b).strip()[:70],
+            "findings": [f.as_dict() for f in findings],
+        })
+    return {"repo": os.path.basename(repo.rstrip("/")), "pairs": results}
+
+
+STATE_BASENAME = ".pkgbuild-review-state.json"
+
+
+def default_state_path(repo):
+    """Anchor the state next to the package collection, never to the cwd.
+
+    A state file that depends on where the gate was invoked from is worse than
+    no state file: a fresh one bootstraps every package as accepted, which
+    silently waves through exactly the change that should have been reviewed.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(repo.rstrip("/"))), STATE_BASENAME)
+
+
+def load_state(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def state_key(repo):
+    return os.path.basename(os.path.abspath(repo).rstrip("/"))
+
+
+def baseline(repo, state_path):
+    """The last commit a human accepted for this package.
+
+    Using the previous HEAD instead would lose changes: if a run aborts and the
+    next run pulls again, the unreviewed commit becomes the new baseline and is
+    never looked at. The baseline only moves on an explicit --accept.
+    """
+    state = load_state(state_path)
+    key = state_key(repo)
+    if key in state:
+        return state[key]["reviewed"], False
+    return git(repo, "rev-parse", "HEAD").strip(), True
+
+
+def accept(repo, rev, state_path):
+    state = load_state(state_path)
+    sha = git(repo, "rev-parse", rev).strip()
+    state[state_key(repo)] = {
+        "reviewed": sha,
+        "subject": git(repo, "log", "-1", "--format=%s", sha).strip()[:120],
+    }
+    save_state(state_path, state)
+    return sha
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("repo", help="package directory (a git clone)")
+    p.add_argument("--old", help="revision before the pull")
+    p.add_argument("--new", default="HEAD", help="revision after the pull")
+    p.add_argument("--json", action="store_true", help="machine-readable verdict")
+    p.add_argument("--no-dep-check", action="store_true",
+                   help="skip pacman resolution of newly added dependencies")
+    p.add_argument("--declared-functions-only", action="store_true",
+                   help="only compare prepare/build/check/package, not helpers")
+    p.add_argument("--replay", action="store_true",
+                   help="classify the whole history instead of one pull")
+    p.add_argument("--limit", type=int, default=0, help="replay: newest N commits only")
+    p.add_argument("--state", default=None,
+                   help="file recording the last reviewed commit per package "
+                        "(default: alongside the package collection)")
+    p.add_argument("--list-local-sources", action="store_true",
+                   help="print the repository paths this package builds from and exit")
+    p.add_argument("--accept", action="store_true",
+                   help="record --new as reviewed; use after looking at a diff")
+    args = p.parse_args()
+    if args.state is None:
+        args.state = default_state_path(args.repo)
+
+    if args.list_local_sources:
+        path = find_pkgbuild(args.repo, args.new)
+        if path is None:
+            print(f"no unique tracked PKGBUILD at {args.new}", file=sys.stderr)
+            return 1
+        text = read_blob(args.repo, args.new, path)
+        if text is None:
+            print("PKGBUILD blob unreadable", file=sys.stderr)
+            return 1
+        try:
+            pkg = PkgBuild(text, path)
+        except ScanError as e:
+            print(f"PKGBUILD: {e}", file=sys.stderr)
+            return 1
+        for entry in sorted(files_compiled_into(pkg, os.path.dirname(path))):
+            print(entry)
+        return 0
+
+    if args.accept:
+        sha = accept(args.repo, args.new, args.state)
+        print(f"recorded {sha[:8]} as reviewed for {state_key(args.repo)}")
+        return 0
+
+    if args.replay:
+        summary = replay(args.repo, args.limit, not args.no_dep_check,
+                         not args.declared_functions_only)
+        print(json.dumps(summary, indent=1))
+        return 0
+
+    bootstrapped = False
+    if not args.old:
+        args.old, bootstrapped = baseline(args.repo, args.state)
+        if bootstrapped:
+            # First sight of this package: whatever is checked out now is what
+            # Ditana has been shipping, so it is the starting point rather than
+            # a change to review.
+            accept(args.repo, args.old, args.state)
+
+    try:
+        findings = review(args.repo, args.old, args.new,
+                          check_deps=not args.no_dep_check,
+                          strict_functions=not args.declared_functions_only)
+    except Exception as e:
+        # The gate failing to decide is itself a reason not to publish.
+        if args.json:
+            print(json.dumps({"verdict": "error", "findings": [
+                {"rule": "gate-error", "detail": f"{type(e).__name__}: {e}"}]}))
+        else:
+            print(f"GATE ERROR in {args.repo}: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+    verdict = "abort" if findings else "pass"
+    if not findings and not bootstrapped:
+        # Each hop was checked, so the accepted point moves with it. This keeps
+        # the diff a human eventually has to read down to the one commit that
+        # actually needs an opinion.
+        accept(args.repo, args.new, args.state)
+    if args.json:
+        print(json.dumps({
+            "repo": args.repo, "old": args.old, "new": args.new,
+            "verdict": verdict,
+            "findings": [f.as_dict() for f in findings],
+        }, indent=1))
+    else:
+        if findings:
+            new_sha = git(args.repo, "rev-parse", args.new).strip()
+            print(f"ABORT {args.repo} ({args.old[:8]}..{new_sha[:8]})")
+            for f in findings:
+                print(f"  - {f}")
+            print(f"\n  review:  git -C {args.repo} log -p {args.old[:8]}..{new_sha[:8]}")
+            print(f"  accept:  {sys.argv[0]} {args.repo} --new {new_sha[:8]} --accept")
+        else:
+            new_sha = git(args.repo, "rev-parse", args.new).strip()
+            print(f"pass  {args.repo} ({args.old[:8]}..{new_sha[:8]})"
+                  + ("  [baseline recorded]" if bootstrapped else ""))
+    return 2 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
