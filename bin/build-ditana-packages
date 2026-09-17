@@ -45,6 +45,7 @@ SIGNING_KEY = "068EEA2A490B0C63AEAA3BCD3EC223A811077C09!"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REVIEW_GATE = os.path.join(HERE, "pkgbuild-review-gate")
 SRCDEST_PREFLIGHT = os.path.join(HERE, "makepkg-srcdest-preflight")
+CLONE_PREFLIGHT = os.path.join(HERE, "clone-preflight")
 # The maintenance contract routes every message via one entry point, so that the
 # transport is set up once in maintenance.conf and the host name is prefixed
 # consistently. Calling a transport directly from here would constitute a second
@@ -290,6 +291,28 @@ def srcdest_preflight():
     print(result.stdout, end="")
     if result.returncode != 0:
         raise RunAborted("stale cached clones in SRCDEST:\n" + result.stdout.strip())
+
+
+def clone_preflight():
+    """Catch clones that git will refuse to update, before anything is built.
+
+    The loop updates each clone as it reaches it, so a refusal there stops the
+    night at that package: everything before it has been built and uploaded to
+    testing, and everything after it is never looked at -- including any second
+    clone in the same state, which then waits a night for the first to be
+    fixed. That is the accumulation the review gate already learned to avoid by
+    naming every package it holds.
+
+    Asking up front costs one fetch per clone and answers for all of them at
+    once.
+    """
+    if not os.path.exists(CLONE_PREFLIGHT):
+        raise RunAborted(f"{CLONE_PREFLIGHT} is missing")
+    print("--- Checking the package clones...")
+    result = subprocess.run([CLONE_PREFLIGHT], capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode != 0:
+        raise RunAborted("package clones that cannot be updated:\n" + result.stdout.strip())
 
 
 def review_pull(pkg_root):
@@ -1266,6 +1289,7 @@ def main():
 
     try:
         srcdest_preflight()
+        clone_preflight()
         # Before updating the chroot, so that it never synchronises a Ditana
         # repository still describing the previous run.
         prepare_local_repo()
@@ -1289,7 +1313,13 @@ def main():
                 zst_files = [f for f in glob.glob(os.path.join(pkg_dir, "*.pkg.tar.zst")) if "-debug" not in f]
 
                 revert_pipeline_edits(pkg_dir)
-                subprocess.run(["git", "pull"], cwd=pkg_dir, check=True)
+                # Not check=True: that raises a CalledProcessError carrying the
+                # argv and an exit status, and on 2026-09-17 that is what the
+                # notification said twice -- "Command '['git', 'pull']' returned
+                # non-zero exit status 1", while git's own sentence, which named
+                # the file in the way, went to the journal and nowhere else.
+                run_reporting_output(["git", "pull"], pkg_dir,
+                                     f"{pkg_name} could not be updated")
                 if not args.skip_review_gate:
                     try:
                         review_pull(dirpath)

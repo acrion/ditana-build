@@ -1,0 +1,188 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Controls for clone-preflight, against real repositories.
+
+The point of the preflight is to predict what `git pull` will do, so the cases
+that matter are checked against git itself: where it says the pull would stop,
+the pull is run afterwards and has to stop; where it says nothing, the pull has
+to go through. A prediction that is merely plausible would be worse than none,
+because the run would then abort on nights when nothing was wrong.
+
+The doctests in clone-preflight cover the decisions. What is built here is the
+states git can be in, which no doctest can produce: an untracked file in the
+way, an ignored one that is not, a diverged branch, a detached HEAD.
+
+Run:  ./clone-preflight-test
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+
+PREFLIGHT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clone-preflight")
+
+GIT_ENV = dict(
+    os.environ,
+    GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.org",
+    GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@example.org",
+    GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+)
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True,
+                          text=True, env=GIT_ENV)
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def make_pair(root, name):
+    """An upstream repository and a clone of it, as the package tree has them.
+
+    The upstream lives outside the directory that is scanned, because the
+    preflight takes every `00N-…` directory for a package clone -- the same
+    rule the run itself uses to decide what to build.
+    """
+    upstream = os.path.join(root, "remotes", name)
+    os.makedirs(upstream)
+    git(upstream, "init", "--quiet", "--initial-branch=master")
+    write(os.path.join(upstream, "PKGBUILD"), "pkgver=1\n")
+    write(os.path.join(upstream, ".gitignore"), "*.zst\n")
+    git(upstream, "add", "-A")
+    git(upstream, "commit", "--quiet", "-m", "initial")
+
+    clone = os.path.join(root, name)
+    subprocess.run(["git", "clone", "--quiet", upstream, clone],
+                   capture_output=True, text=True, env=GIT_ENV, check=True)
+    return upstream, clone
+
+
+def upstream_adds(upstream, path, text="artefact\n"):
+    write(os.path.join(upstream, path), text)
+    git(upstream, "add", "-A")
+    git(upstream, "commit", "--quiet", "-m", f"add {path}")
+
+
+def preflight(root, *packages):
+    return subprocess.run([PREFLIGHT, *packages], cwd=root,
+                          capture_output=True, text=True, env=GIT_ENV)
+
+
+def pull_fails(clone):
+    """What git itself does, which is what the preflight claims to predict."""
+    return git(clone, "pull").returncode != 0
+
+
+class Report:
+    def __init__(self):
+        self.checked = 0
+        self.failures = []
+
+    def case(self, label, condition, detail=""):
+        self.checked += 1
+        if condition:
+            print(f"  ok   {label}")
+        else:
+            print(f"  FAIL {label}{': ' + detail if detail else ''}")
+            self.failures.append(label)
+
+
+def main():
+    r = Report()
+
+    print("a clone that can be updated:")
+    with tempfile.TemporaryDirectory() as root:
+        upstream, clone = make_pair(root, "001-demo")
+        upstream_adds(upstream, "NEWS", "news\n")
+        # The state of every built package directory: artefacts nobody tracks.
+        write(os.path.join(clone, "demo-1-1-any.pkg.tar.zst"), "binary\n")
+        write(os.path.join(clone, "demo-1-1-any.pkg.tar.zst.sig"), "signature\n")
+        result = preflight(root, "001-demo")
+        r.case("untouched artefacts are not a finding", result.returncode == 0, result.stdout)
+        r.case("and the pull really goes through", not pull_fails(clone))
+
+    print("\nthe night of 2026-09-17: upstream adds a file the pipeline had built:")
+    with tempfile.TemporaryDirectory() as root:
+        upstream, clone = make_pair(root, "001-wayland-display-info")
+        sig = "wayland-display-info-1.0.8-1-any.pkg.tar.zst.sig"
+        write(os.path.join(clone, sig), "signature\n")
+        upstream_adds(upstream, sig, "signature from elsewhere\n")
+        result = preflight(root, "001-wayland-display-info")
+        r.case("the collision is found", result.returncode == 2, result.stdout)
+        r.case("and the file is named", sig in result.stdout, result.stdout)
+        r.case("and git would indeed refuse", pull_fails(clone))
+
+    print("\nan ignored file in the same position:")
+    with tempfile.TemporaryDirectory() as root:
+        upstream, clone = make_pair(root, "001-demo")
+        # .gitignore covers *.zst, and git overwrites ignored files without a
+        # word. Reporting this would abort runs over something git does not
+        # mind, which is the failure mode a predictor has to avoid.
+        write(os.path.join(clone, "demo-1-1-any.pkg.tar.zst"), "local\n")
+        upstream_adds(upstream, "demo-1-1-any.pkg.tar.zst", "from upstream\n")
+        result = preflight(root, "001-demo")
+        r.case("it is not reported", result.returncode == 0, result.stdout)
+        r.case("because git overwrites it silently", not pull_fails(clone))
+
+    print("\nlocal commits:")
+    with tempfile.TemporaryDirectory() as root:
+        upstream, clone = make_pair(root, "001-zelph")
+        write(os.path.join(clone, "PKGBUILD"), "pkgver=2\n")
+        git(clone, "commit", "--quiet", "-am", "unpushed work")
+        result = preflight(root, "001-zelph")
+        r.case("ahead of the upstream is no finding", result.returncode == 0, result.stdout)
+
+        upstream_adds(upstream, "NEWS", "news\n")
+        result = preflight(root, "001-zelph")
+        r.case("diverged is a finding", result.returncode == 2, result.stdout)
+        r.case("and it says how far apart", "1 local commit(s) and 1 incoming" in result.stdout,
+               result.stdout)
+
+    print("\na clone that is not on a branch:")
+    with tempfile.TemporaryDirectory() as root:
+        upstream, clone = make_pair(root, "001-demo")
+        head = git(clone, "rev-parse", "HEAD").stdout.strip()
+        git(clone, "checkout", "--quiet", head)
+        result = preflight(root, "001-demo")
+        r.case("a detached HEAD is a finding", result.returncode == 2, result.stdout)
+        r.case("and git would indeed refuse", pull_fails(clone))
+
+    print("\na remote that cannot be reached:")
+    with tempfile.TemporaryDirectory() as root:
+        upstream, clone = make_pair(root, "001-demo")
+        os.rename(upstream, upstream + ".moved")
+        result = preflight(root, "001-demo")
+        r.case("the fetch failure is a finding", result.returncode == 2, result.stdout)
+        r.case("and the clone is named", "001-demo: could not fetch" in result.stdout,
+               result.stdout)
+
+    print("\nseveral clones at once:")
+    with tempfile.TemporaryDirectory() as root:
+        up_a, clone_a = make_pair(root, "001-first")
+        up_b, clone_b = make_pair(root, "002-second")
+        make_pair(root, "003-third")
+        for up, clone in ((up_a, clone_a), (up_b, clone_b)):
+            write(os.path.join(clone, "collision"), "here\n")
+            upstream_adds(up, "collision", "incoming\n")
+        result = preflight(root)
+        # The whole point of checking before the loop: the run stops at the
+        # first package, so a second finding would otherwise wait a night for
+        # the first to be fixed. The gate learned that the expensive way.
+        r.case("both are named in one run",
+               "001-first" in result.stdout and "002-second" in result.stdout, result.stdout)
+        r.case("the sound one is not", "003-third" not in result.stdout, result.stdout)
+
+    print(f"\n--- {r.checked - len(r.failures)} of {r.checked} checks passed")
+    if r.failures:
+        print(f"{len(r.failures)} failed: " + ", ".join(r.failures))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

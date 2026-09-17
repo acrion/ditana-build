@@ -29,6 +29,7 @@ SCRIPTS = [
     "ditana-test-install",
     "build-ditana-packages",
     "release-after-test",
+    "clone-preflight",
 ]
 
 

@@ -1,0 +1,217 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Find package clones that `git pull` will refuse to update.
+
+The run updates each clone in turn, and a refusal there ends the night. On
+2026-09-17 that happened twice over: an upstream commit added a file that the
+pipeline itself had already produced, untracked, in the same directory -- the
+detached signature of a package it had built and signed there. git will not
+overwrite an untracked file, so it aborted, and with it the run.
+
+Two properties of the loop make this the pipeline's blind spot rather than an
+accident. `git clean -xfdf` removes such leftovers, but it runs *after* the
+pull and only for a package that is going to be rebuilt anyway, so a package
+considered current is never cleaned. And revert_pipeline_edits, which puts
+tracked files back, skips untracked ones on purpose and leaves them to that
+clean.
+
+So this asks the same question up front, for every clone at once. Up front,
+because a clone that cannot be updated is not a property of the package it
+stops at: the run has by then uploaded what it built before it, and what the
+other clones would have said stays unsaid. And for every clone at once, for
+the reason the review gate names every package it holds -- a second finding
+that waits for the first to be fixed is a finding nobody sees for another
+night.
+
+It fetches. That is the whole cost, and it is what makes the question
+answerable before the working tree is touched: what a pull would write is the
+difference between HEAD and the fetched upstream.
+
+Nothing is repaired here. A colliding artefact could be moved aside
+automatically, and in this one case that would even have been right -- but the
+same move would silently hide a repository that genuinely ships such a file,
+and the all-or-nothing invariant asks for the problem to be surfaced rather
+than smoothed over.
+
+Exit codes:
+    0   every clone can be updated
+    2   at least one clone would stop the run
+    1   the check itself could not decide
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+FETCH_TIMEOUT_SECONDS = 180
+
+
+def problems_for(pkgdir, head, upstream, fetch_error, ahead, behind, incoming, untracked):
+    """What about this clone would stop a run, given what git reported.
+
+    Kept apart from the git plumbing so the decisions can be read, and tested,
+    without a repository: every case below was written from a state git can
+    actually produce.
+
+    A clone that is merely ahead of its upstream is not a finding. Stefan
+    maintains four of these packages in the AUR and commits in the tree he
+    builds from, so unpushed work is an ordinary state, and a pull over it
+    changes nothing:
+
+    >>> problems_for("001-zelph", "master", "origin/master", None, 3, 0, [], [])
+    []
+
+    Diverged is a finding, because the pull would build a merge nobody asked
+    for:
+
+    >>> problems_for("001-zelph", "master", "origin/master", None, 2, 5, [], [])
+    ['001-zelph: 2 local commit(s) and 5 incoming; git pull would merge them']
+
+    The case that stopped the run of 2026-09-17: an incoming file is already
+    there, untracked.
+
+    >>> problems_for("001-wayland-display-info", "master", "origin/master", None, 0, 1,
+    ...              ["PKGBUILD", "x-1.0.8-1-any.pkg.tar.zst.sig"],
+    ...              ["x-1.0.8-1-any.pkg.tar.zst.sig", "note.txt"])
+    ['001-wayland-display-info: git pull would overwrite untracked x-1.0.8-1-any.pkg.tar.zst.sig']
+
+    Only files that arrive count. An untracked file the incoming commits do not
+    touch is what every built package directory is full of:
+
+    >>> problems_for("001-x", "master", "origin/master", None, 0, 1, ["PKGBUILD"],
+    ...              ["x-1.0.8-1-any.pkg.tar.zst.sig"])
+    []
+
+    A detached HEAD and a missing upstream both leave the pull with nothing to
+    do, and say so before it does:
+
+    >>> problems_for("001-x", None, None, None, 0, 0, [], [])
+    ['001-x: HEAD is detached; git pull has no branch to update']
+    >>> problems_for("001-x", "master", None, None, 0, 0, [], [])
+    ['001-x: the branch master has no upstream; git pull has nothing to pull from']
+
+    A remote that could not be reached is reported rather than assumed to be
+    fine, because the pull would meet the same remote:
+
+    >>> problems_for("001-x", "master", "origin/master", "Could not resolve host", 0, 0, [], [])
+    ['001-x: could not fetch: Could not resolve host']
+    """
+    if head is None:
+        return [f"{pkgdir}: HEAD is detached; git pull has no branch to update"]
+    if upstream is None:
+        return [f"{pkgdir}: the branch {head} has no upstream; "
+                f"git pull has nothing to pull from"]
+    if fetch_error:
+        return [f"{pkgdir}: could not fetch: {fetch_error}"]
+
+    problems = []
+    if ahead and behind:
+        problems.append(f"{pkgdir}: {ahead} local commit(s) and {behind} incoming; "
+                        f"git pull would merge them")
+    for path in sorted(set(incoming) & set(untracked)):
+        problems.append(f"{pkgdir}: git pull would overwrite untracked {path}")
+    return problems
+
+
+def git(pkgdir, *args, timeout=None):
+    """Run git in the clone and return (returncode, stdout, stderr)."""
+    result = subprocess.run(["git", "-C", pkgdir, *args],
+                            capture_output=True, text=True, timeout=timeout)
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def inspect(pkgdir, fetch=True):
+    """Gather the state of one clone and decide about it.
+
+    Returns (problems, unverifiable).
+    """
+    code, _, _ = git(pkgdir, "rev-parse", "--git-dir")
+    if code != 0:
+        return [], [f"{pkgdir}: not a git repository"]
+
+    code, head, _ = git(pkgdir, "symbolic-ref", "--quiet", "--short", "HEAD")
+    head = head if code == 0 and head else None
+
+    upstream = None
+    if head is not None:
+        code, upstream, _ = git(pkgdir, "rev-parse", "--abbrev-ref",
+                                "--symbolic-full-name", "@{u}")
+        upstream = upstream if code == 0 and upstream else None
+
+    fetch_error = None
+    if fetch and head is not None and upstream is not None:
+        try:
+            code, _, err = git(pkgdir, "fetch", "--quiet",
+                               timeout=FETCH_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            code, err = 1, f"no answer within {FETCH_TIMEOUT_SECONDS}s"
+        if code != 0:
+            fetch_error = " ".join(err.splitlines()[-1:]) or f"git fetch exited {code}"
+
+    ahead = behind = 0
+    incoming, untracked = [], []
+    if head is not None and upstream is not None and not fetch_error:
+        code, counts, _ = git(pkgdir, "rev-list", "--left-right", "--count",
+                              f"HEAD...{upstream}")
+        if code == 0 and len(counts.split()) == 2:
+            ahead, behind = (int(n) for n in counts.split())
+        # What a fast-forward would write into the working tree.
+        code, names, _ = git(pkgdir, "diff", "--name-only", "HEAD", upstream)
+        if code == 0:
+            incoming = names.splitlines()
+        # Ignored files are deliberately excluded: git overwrites them
+        # without complaining, and every built package directory is full of
+        # them.
+        code, names, _ = git(pkgdir, "ls-files", "--others", "--exclude-standard")
+        if code == 0:
+            untracked = names.splitlines()
+
+    return problems_for(pkgdir, head, upstream, fetch_error,
+                        ahead, behind, incoming, untracked), []
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("packages", nargs="*",
+                   help="package directories (default: 00*-*/ below the cwd)")
+    p.add_argument("--no-fetch", action="store_true",
+                   help="decide on what is already fetched, without touching the network")
+    args = p.parse_args()
+
+    packages = args.packages or sorted(
+        d for d in os.listdir(".")
+        if os.path.isdir(d) and re.match(r"^00\d-.", d)
+    )
+    if not packages:
+        print("no package directories found", file=sys.stderr)
+        return 1
+
+    all_problems, all_unverifiable = [], []
+    for pkgdir in packages:
+        problems, unverifiable = inspect(pkgdir.rstrip("/"), fetch=not args.no_fetch)
+        all_problems += problems
+        all_unverifiable += unverifiable
+
+    if all_unverifiable:
+        print(f"{len(all_unverifiable)} clone(s) could not be checked:")
+        for u in all_unverifiable:
+            print(f"  - {u}")
+        print()
+
+    if not all_problems:
+        print(f"{len(packages)} clone(s): every one can be updated.")
+        return 0 if not all_unverifiable else 1
+
+    print(f"{len(all_problems)} clone(s) would stop the run:\n")
+    for problem in all_problems:
+        print(f"  - {problem}")
+    print("\nEach has to be settled where it is: an artefact that upstream now "
+          "tracks belongs out of the repository, local commits belong pushed or "
+          "dropped, a detached HEAD belongs back on its branch.")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

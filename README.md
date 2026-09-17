@@ -41,6 +41,8 @@ half days. That is the price of the guarantee, not a defect.
 | `bin/pkgbuild-review-gate` | Classifies what each `git pull` brought in; stops the run for anything not safe by construction |
 | `bin/pkgbuild-review-gate-test` | 34 control cases for the gate — 24 attacks, 10 benign changes |
 | `bin/makepkg-srcdest-preflight` | Detects cached VCS clones makepkg would refuse, before hours are spent |
+| `bin/clone-preflight` | Detects package clones `git pull` would refuse, and names each one of them |
+| `bin/clone-preflight-test` | Controls for that, checked against what git itself does |
 | `bin/setup-package-clones` | Creates the package clones with the correct remote layout |
 | `bin/set-clone-mtimes` | Gives a fresh clone file times that reflect the age of its content |
 | `bin/setup-buildroot` | Prepares a host for chroot builds: chroot, its pacman.conf, the sudo rules |
@@ -62,6 +64,14 @@ half days. That is the price of the guarantee, not a defect.
 | `systemd/` | Timer and service for the unattended build, plus the optional drop-in that puts it inside a maintenance lock |
 | `docs/build-host.md` | How to stand a build host up from a fresh installation |
 | `docs/testing-medium.md` | What the medium the nightly test installs from has to be, and how to build one |
+
+## Before the first package is touched
+
+Two checks occur prior to the loop, and both exist for the same reason: a state that stops the run is worth far less as a finding observed hours in, after everything ahead of it has been built and uploaded. `makepkg-srcdest-preflight` compares the cached VCS clones against the URLs specified in the PKGBUILDs. `clone-preflight` fetches every package clone and inquires whether `git pull` can update it at all – an untracked file that an incoming commit would overwrite, a diverged branch, a detached HEAD, a remote that does not answer.
+
+Both name every package they find rather than the first. The run stops at the first one anyway, so a second finding would otherwise wait a night for the first to be fixed, and a third for the second; the review gate learned that over fifteen nights in 2026, and the preflights are written so that it cannot repeat there.
+
+Neither repairs anything. What stopped the run on 2026-09-17 was a detached signature this pipeline had produced in the clone and that upstream then committed: deleting it automatically would have been right in that case and wrong in general, because the same move hides a repository that ships such a file intentionally.
 
 ## The review gate
 
