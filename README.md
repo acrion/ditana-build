@@ -43,6 +43,8 @@ half days. That is the price of the guarantee, not a defect.
 | `bin/makepkg-srcdest-preflight` | Detects cached VCS clones makepkg would refuse, before hours are spent |
 | `bin/clone-preflight` | Detects package clones `git pull` would refuse, and names each one of them |
 | `bin/clone-preflight-test` | Controls for that, checked against what git itself does |
+| `bin/chrome-sandbox-check` | Finds packages whose sandbox helper for Chromium is not setuid root, which aborts on Ditana |
+| `bin/chrome-sandbox-check-test` | Controls for that, against real package archives |
 | `bin/setup-package-clones` | Creates the package clones with the correct remote layout |
 | `bin/set-clone-mtimes` | Gives a fresh clone file times that reflect the age of its content |
 | `bin/setup-buildroot` | Prepares a host for chroot builds: chroot, its pacman.conf, the sudo rules |
@@ -134,6 +136,12 @@ sources on the host first (`makepkg --verifysource`, or `makepkg -od
 --noprepare` for VCS packages). Without that, no checksum and no source
 signature would be verified anywhere, and the gate's rule that a checksum may
 only change together with a version would be guarding nothing.
+
+## What a built package is checked for
+
+A package can compile successfully and still be one that does not work on Ditana. The case the pipeline identifies is Chromium’s sandbox helper. Ditana refuses user namespaces for programs that have not declared a need for one, so a program built using Chromium or Electron is left only with the setuid helper `chrome-sandbox` to build its sandbox, and without it the program aborts at start.
+
+`chrome-sandbox-check` reads each package right after it is built, before it is signed, and stops the run for a helper that is not setuid root. The package is recorded as failed, with the path and the mode that were found. It covers the packages a run rebuilds; for the whole repository, run it over the archives there: `bin/chrome-sandbox-check <repository>/*.pkg.tar.zst`.
 
 ## Signing, and where the key lives
 

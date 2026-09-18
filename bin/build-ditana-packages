@@ -46,6 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REVIEW_GATE = os.path.join(HERE, "pkgbuild-review-gate")
 SRCDEST_PREFLIGHT = os.path.join(HERE, "makepkg-srcdest-preflight")
 CLONE_PREFLIGHT = os.path.join(HERE, "clone-preflight")
+CHROME_SANDBOX_CHECK = os.path.join(HERE, "chrome-sandbox-check")
 # The maintenance contract routes every message via one entry point, so that the
 # transport is set up once in maintenance.conf and the host name is prefixed
 # consistently. Calling a transport directly from here would constitute a second
@@ -313,6 +314,31 @@ def clone_preflight():
     print(result.stdout, end="")
     if result.returncode != 0:
         raise RunAborted("package clones that cannot be updated:\n" + result.stdout.strip())
+
+
+def chrome_sandbox_check(pkg_name, zst_files):
+    """Stop before a package is signed whose Chromium cannot start on Ditana.
+
+    Ditana refuses user namespaces to programs that have not declared a need
+    for one, which leaves Chromium's setuid helper as its only way to build a
+    sandbox. A package shipping that helper without the setuid bit builds,
+    installs and passes every other check, and then aborts at start on every
+    machine it reaches.
+
+    A package the check cannot read stops the run as well. Letting it through
+    would make an unreadable archive the one kind that is never checked:
+
+    >>> try:
+    ...     chrome_sandbox_check("x", ["/nonexistent/x-1-1-x86_64.pkg.tar.zst"])
+    ... except RunAborted as e:
+    ...     print(str(e).splitlines()[:2])
+    ['x cannot be shipped:', "could not be read: /nonexistent/x-1-1-x86_64.pkg.tar.zst: [Errno 2] No such file or directory: '/nonexistent/x-1-1-x86_64.pkg.tar.zst'"]
+    """
+    if not os.path.exists(CHROME_SANDBOX_CHECK):
+        raise RunAborted(f"{CHROME_SANDBOX_CHECK} is missing")
+    result = subprocess.run([CHROME_SANDBOX_CHECK, *zst_files], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RunAborted(f"{pkg_name} cannot be shipped:\n" + result.stdout.strip())
 
 
 def review_pull(pkg_root):
@@ -1422,6 +1448,13 @@ def main():
 
                     if not zst_files:
                         raise FileNotFoundError(f"No .pkg.tar.zst files found in {pkg_dir}.")
+
+                    try:
+                        chrome_sandbox_check(pkg_name, zst_files)
+                    except RunAborted as e:
+                        run.package(pkg_name, "build-failed", str(e),
+                                    time.monotonic() - pkg_started)
+                        raise
 
                     for zf in zst_files:
                         os.chmod(zf, 0o644)

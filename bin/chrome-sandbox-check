@@ -1,0 +1,123 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Find packages whose Chromium sandbox helper is not setuid root.
+
+Chromium, and every Electron application with it, sandboxes the pages it
+renders in one of two ways: in a user namespace, or, if the kernel refuses it
+one, through the helper `chrome-sandbox` that ships beside the executable,
+which has to be setuid root for that. Where neither works it does not run
+without a sandbox; it aborts at start with "The SUID sandbox helper binary was
+found, but is not configured correctly".
+
+Ditana refuses user namespaces to every program that has not declared a need
+for one, so on Ditana the helper is the only way that works. Arch installs it
+setuid for chromium and every electron package; a package that brings its own
+Chromium has to do the same. logseq-desktop-bin did not, and was found by a
+user whose Logseq no longer started, not by the build that produced it.
+
+A helper that is a symlink is left alone: what it points to belongs to
+another package, and the listing of this one cannot say what that is.
+
+Exit codes:
+    0   every helper found is setuid root, or there is none
+    2   at least one package ships a helper that is not
+    1   a package could not be read
+"""
+
+import argparse
+import os
+import sys
+import tarfile
+
+HELPER_NAMES = ("chrome-sandbox", "chrome_sandbox")
+
+
+def helper_problems(package, entries):
+    """What about these archive entries would make Chromium abort.
+
+    entries are (path, kind, mode, uid), where kind is "file", "symlink" or
+    anything else tarfile knows. The condition is the one Chromium tests in
+    setuid_sandbox_host.cc: owned by root, setuid, and executable by others.
+
+    The helper Arch ships for chromium and electron:
+
+    >>> helper_problems("electron43", [("usr/lib/electron43/chrome-sandbox", "file", 0o4755, 0)])
+    []
+
+    The one logseq-desktop-bin ships, stripped of its setuid bit by the
+    recipe's own `chmod -R u=rwX,go=rX`:
+
+    >>> helper_problems("logseq-desktop-bin",
+    ...                 [("opt/logseq-desktop/chrome-sandbox", "file", 0o755, 0)])
+    ['logseq-desktop-bin: opt/logseq-desktop/chrome-sandbox has mode 0755 and uid 0, where 4755 and uid 0 are needed']
+
+    setuid, but not root's, is no helper at all:
+
+    >>> helper_problems("x", [("opt/x/chrome-sandbox", "file", 0o4755, 1000)])
+    ['x: opt/x/chrome-sandbox has mode 4755 and uid 1000, where 4755 and uid 0 are needed']
+
+    The older name counts too, and other files named like it do not:
+
+    >>> helper_problems("x", [("opt/x/chrome_sandbox", "file", 0o755, 0),
+    ...                       ("opt/x/chrome-sandbox.sig", "file", 0o644, 0)])
+    ['x: opt/x/chrome_sandbox has mode 0755 and uid 0, where 4755 and uid 0 are needed']
+
+    A symlink points into another package, which this listing cannot see:
+
+    >>> helper_problems("x", [("opt/x/chrome-sandbox", "symlink", 0o777, 0)])
+    []
+    """
+    problems = []
+    for path, kind, mode, uid in entries:
+        if os.path.basename(path) not in HELPER_NAMES or kind != "file":
+            continue
+        if uid == 0 and mode & 0o4000 and mode & 0o001:
+            continue
+        problems.append(f"{package}: {path} has mode {mode & 0o7777:04o} and uid {uid}, "
+                        f"where 4755 and uid 0 are needed")
+    return problems
+
+
+def read_package(path):
+    """The package name and the entries of one package archive."""
+    name = None
+    entries = []
+    with tarfile.open(path, "r:*") as archive:
+        for member in archive:
+            if member.name == ".PKGINFO":
+                for line in archive.extractfile(member).read().decode().splitlines():
+                    if line.startswith("pkgname = "):
+                        name = line.split(" = ", 1)[1].strip()
+                continue
+            kind = "file" if member.isfile() else "symlink" if member.issym() else "other"
+            entries.append((member.name, kind, member.mode, member.uid))
+    return name or os.path.basename(path), entries
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("packages", nargs="+", help="package archives (*.pkg.tar.zst)")
+    args = p.parse_args()
+
+    problems, unreadable = [], []
+    for path in args.packages:
+        try:
+            name, entries = read_package(path)
+        except (OSError, tarfile.TarError) as e:
+            unreadable.append(f"{path}: {e}")
+            continue
+        problems += helper_problems(name, entries)
+
+    for u in unreadable:
+        print(f"could not be read: {u}")
+    for problem in problems:
+        print(problem)
+    if problems:
+        print("Under Ditana's default hardening these programs abort at start. The recipe "
+              "has to install the helper setuid root, as Arch does for chromium and electron.")
+        return 2
+    return 1 if unreadable else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

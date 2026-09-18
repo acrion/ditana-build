@@ -1,0 +1,93 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Controls for chrome-sandbox-check, against real package archives.
+
+The doctests in chrome-sandbox-check cover the decision. What is built here is
+the other half: zstd-compressed tar archives with a .PKGINFO, as makepkg writes
+them, read back the way the check reads a package the pipeline has just built.
+Ownership and mode are header fields, so a root-owned setuid file can be
+written without being root.
+
+Run:  ./chrome-sandbox-check-test
+"""
+
+import io
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+CHECK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome-sandbox-check")
+
+
+def make_package(directory, pkgname, members):
+    """members: (path, kind, mode, uid); kind is "file" or "symlink"."""
+    path = os.path.join(directory, f"{pkgname}-1-1-x86_64.pkg.tar.zst")
+    with tarfile.open(path, "w:zst") as archive:
+        def add(info, data=b""):
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        pkginfo = tarfile.TarInfo(".PKGINFO")
+        add(pkginfo, f"pkgname = {pkgname}\npkgver = 1-1\n".encode())
+        for name, kind, mode, uid in members:
+            info = tarfile.TarInfo(name)
+            info.mode, info.uid = mode, uid
+            info.uname = "root" if uid == 0 else "user"
+            if kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = "/usr/lib/electron43/chrome-sandbox"
+                add(info)
+            else:
+                add(info, b"\x7fELF")
+    return path
+
+
+def check(*paths):
+    return subprocess.run([CHECK, *paths], capture_output=True, text=True)
+
+
+def main():
+    passed = failed = 0
+
+    def expect(name, condition, detail=""):
+        nonlocal passed, failed
+        if condition:
+            passed += 1
+            print(f"  ok   {name}")
+        else:
+            failed += 1
+            print(f"  FAIL {name}{': ' + detail if detail else ''}")
+
+    with tempfile.TemporaryDirectory() as d:
+        good = make_package(d, "good-bin", [("opt/good/chrome-sandbox", "file", 0o4755, 0),
+                                            ("opt/good/good", "file", 0o755, 0)])
+        bad = make_package(d, "bad-bin", [("opt/bad/chrome-sandbox", "file", 0o755, 0)])
+        linked = make_package(d, "linked", [("usr/lib/linked/chrome-sandbox", "symlink", 0o777, 0)])
+        plain = make_package(d, "plain", [("usr/bin/plain", "file", 0o755, 0)])
+
+        print("== a setuid-root helper, a symlinked one, and none at all ==")
+        r = check(good, linked, plain)
+        expect("they pass", r.returncode == 0, r.stdout + r.stderr)
+
+        print("== a helper without the setuid bit ==")
+        r = check(good, bad)
+        expect("it is reported", r.returncode == 2, str(r.returncode))
+        expect("under the name in .PKGINFO, with its path and mode",
+               "bad-bin: opt/bad/chrome-sandbox has mode 0755" in r.stdout, r.stdout)
+        expect("the good one beside it is not", "good-bin" not in r.stdout, r.stdout)
+
+        print("== a file that is not a package ==")
+        junk = os.path.join(d, "junk.pkg.tar.zst")
+        with open(junk, "wb") as f:
+            f.write(b"not an archive")
+        r = check(junk)
+        expect("it cannot be decided, and says so", r.returncode == 1 and "could not be read" in r.stdout,
+               r.stdout + r.stderr)
+
+    print(f"--- {passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

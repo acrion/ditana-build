@@ -30,6 +30,7 @@ SCRIPTS = [
     "build-ditana-packages",
     "release-after-test",
     "clone-preflight",
+    "chrome-sandbox-check",
 ]
 
 
