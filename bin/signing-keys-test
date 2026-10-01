@@ -1,0 +1,154 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Controls for how the pipeline treats the signing keys a package names.
+
+Before it verifies a package's sources, the pipeline refreshes the keys the
+keyring already holds, and only those: whether to trust a key at all stays a
+human decision. When a source is signed by a key the keyring lacks, the run
+stops as before, and the message has to say what to do.
+
+gpg and makepkg are replaced by stubs on PATH that record how they were called,
+so nothing here needs a network or a real keyring.
+
+Run:  ./signing-keys-test
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+HELD = "DB2BA39D1ED967B584D65D71C09FF113BB6410D0"
+MISSING = "C33DF142657ED1F7C328A2960AB9E991C6AF658B"
+
+FAKE_GPG = """#!/usr/bin/env bash
+echo "$*" >> "$FAKE_LOG"
+case " $* " in
+  *" --list-keys "*)
+    for k in $FAKE_HELD; do [[ " $* " == *" $k "* ]] && exit 0; done
+    exit 2 ;;
+  *" --refresh-keys "*) exit "${FAKE_REFRESH_RC:-0}" ;;
+esac
+exit 99
+"""
+
+# Responds in German unless LC_ALL=C, mirroring the behaviour of makepkg's
+# own messages.
+FAKE_MAKEPKG = """#!/usr/bin/env bash
+if [[ ${FAKE_MAKEPKG_RC:-0} == 0 ]]; then echo "verified"; exit 0; fi
+if [[ $FAKE_FAILURE == key ]]; then
+  if [[ ${LC_ALL-} == C ]]; then
+    echo "    x.tar.gz ... FAILED (unknown public key 0AB9E991C6AF658B)"
+  else
+    echo "    x.tar.gz ... FEHLGESCHLAGEN (unbekannter öffentlicher Schlüssel 0AB9E991C6AF658B)"
+  fi
+else
+  echo "    x.tar.gz ... FAILED"
+fi
+exit 1
+"""
+
+
+def load_pipeline():
+    path = os.path.join(HERE, "build-ditana-packages")
+    loader = importlib.machinery.SourceFileLoader("build_ditana_packages", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main():
+    pipeline = load_pipeline()
+    failures, checked = [], 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stubs = os.path.join(tmp, "stubs")
+        os.mkdir(stubs)
+        for name, text in (("gpg", FAKE_GPG), ("makepkg", FAKE_MAKEPKG)):
+            with open(os.path.join(stubs, name), "w") as fh:
+                fh.write(text)
+            os.chmod(os.path.join(stubs, name), 0o755)
+        os.environ["PATH"] = stubs + os.pathsep + os.environ["PATH"]
+
+        pkg = os.path.join(tmp, "001-demo")
+        os.mkdir(pkg)
+        with open(os.path.join(pkg, ".SRCINFO"), "w") as fh:
+            fh.write(f"pkgbase = demo\n\tvalidpgpkeys = {HELD}\n\tvalidpgpkeys = {MISSING}\n")
+        log = os.path.join(tmp, "calls")
+
+        def scenario(**env):
+            open(log, "w").close()
+            os.environ.update({"FAKE_LOG": log, "FAKE_HELD": HELD, "FAKE_REFRESH_RC": "0",
+                               "FAKE_MAKEPKG_RC": "0", "FAKE_FAILURE": "", "LANG": "de_DE.UTF-8"})
+            os.environ.update(env)
+
+        def calls():
+            with open(log) as fh:
+                return fh.read().splitlines()
+
+        def check(label, ok, detail=""):
+            nonlocal checked
+            checked += 1
+            if not ok:
+                failures.append(f"{label}: {detail}")
+            print(f"  {'ok ' if ok else 'FAIL'} {label}")
+
+        # The fundamental property upon which everything depends: a refresh
+        # does not reach a key that nobody has imported.
+        scenario()
+        missing = pipeline.refresh_signing_keys(pkg)
+        refreshes = [c for c in calls() if "--refresh-keys" in c]
+        check("only held keys are refreshed",
+              len(refreshes) == 1 and HELD in refreshes[0] and MISSING not in refreshes[0],
+              f"refresh calls: {refreshes}")
+        check("keys the keyring lacks are returned", missing == [MISSING], f"got {missing}")
+
+        scenario(FAKE_HELD="")
+        pipeline.refresh_signing_keys(pkg)
+        check("no held key, no refresh", not [c for c in calls() if "--refresh-keys" in c],
+              f"calls: {calls()}")
+
+        # A keyserver that cannot be reached must not stop a run that
+        # checks successfully using the copy it already possesses.
+        scenario(FAKE_REFRESH_RC="2")
+        try:
+            pipeline.prepare_sources(pkg, False)
+            check("a failed refresh does not stop the run", True)
+        except Exception as e:
+            check("a failed refresh does not stop the run", False, repr(e))
+
+        # Under a German locale, the message "unknown public key" would not
+        # appear, and the hint would be lost; the pipeline executes it with
+        # LC_ALL=C.
+        scenario(FAKE_MAKEPKG_RC="1", FAKE_FAILURE="key")
+        try:
+            pipeline.prepare_sources(pkg, False)
+            check("an unknown key stops the run and says what to do", False, "no abort")
+        except pipeline.RunAborted as e:
+            check("an unknown key stops the run and says what to do",
+                  f"--recv-keys {MISSING}" in str(e) and HELD not in str(e).split("--recv-keys")[1],
+                  str(e))
+
+        scenario(FAKE_MAKEPKG_RC="1", FAKE_FAILURE="checksum")
+        try:
+            pipeline.prepare_sources(pkg, False)
+            check("any other failure carries no import hint", False, "no abort")
+        except pipeline.RunAborted as e:
+            check("any other failure carries no import hint", "--recv-keys" not in str(e), str(e))
+
+    print()
+    if failures:
+        print(f"{len(failures)} of {checked} checks failed:\n")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"all {checked} checks behaved as expected")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

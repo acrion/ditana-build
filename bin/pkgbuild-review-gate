@@ -603,6 +603,15 @@ class Finding:
 # them would rewrite every matching digit of a commit hash.
 VERSION_VARS = ("pkgver", "_pkgver", "_version", "_ver")
 
+# What a version value can contain. A moved version is placed within a URL that
+# remains otherwise unaltered, thus it must not have the power to change what
+# that URL points to: neither `/` (together with `..` it would access another
+# repository on the same host), nor `@` (which carries user details and could
+# lead to a different host), nor any of `:`, `?`, `#`, `%`, quotes, or
+# whitespace. While makepkg rejects some of these in pkgver, `_ver` and its
+# related variables are plain shell variables with no validation applied.
+VERSION_VALUE = re.compile(r"^v?\d[0-9A-Za-z._+~-]*$")
+
 # Shortest value that may be used as a substitution literal. Below this a value
 # is not distinctive enough to replace blindly inside a URL.
 MIN_SUBSTITUTABLE = 4
@@ -621,27 +630,96 @@ OBFUSCATION_PATTERNS = [
 ]
 
 
-def version_placeholders(old, new):
-    """Build substitution tables that neutralise an ordinary version bump.
+def moved_versions(old, new):
+    """The version variables that moved to another version, as {name: (old, new)}.
+
+    Both values have to match VERSION_VALUE, so that a helper variable cannot be
+    repurposed to smuggle a changed URL past the comparison. A variable that
+    moves to anything else is not a version bump, and whatever it reaches is
+    compared as it is.
+    """
+    moved = {}
+    for name in VERSION_VARS:
+        o = old.expand(old.scalars.get(name, ""))
+        n = new.expand(new.scalars.get(name, ""))
+        if o and n and o != n and VERSION_VALUE.match(o) and VERSION_VALUE.match(n):
+            moved[name] = (o, n)
+    return moved
+
+
+def version_placeholders(moved):
+    """Build substitution tables for a version written literally into a value.
+
+    This is the fallback behind `built_alike()`, for an entry whose text changes
+    with every version: `b43-firmware` writes its version into the URL by hand.
+    Values shorter than MIN_SUBSTITUTABLE are left out, because `13` would also
+    replace digits inside a commit hash.
 
     Returns (old_subs, new_subs): value -> placeholder, applied to the
     respective side before comparing source URLs and file names.
     """
     old_subs, new_subs = {}, {}
-    for name in VERSION_VARS:
-        o = old.expand(old.scalars.get(name, ""))
-        n = new.expand(new.scalars.get(name, ""))
-        if not o or not n or o == n:
-            continue
-        # Only version-shaped values are neutralised, so that a helper variable
-        # cannot be repurposed to smuggle a changed URL past the comparison.
-        if not (re.match(r"^v?\d", o) and re.match(r"^v?\d", n)):
-            continue
+    for name, (o, n) in moved.items():
         if len(o) < MIN_SUBSTITUTABLE or len(n) < MIN_SUBSTITUTABLE:
             continue
         old_subs[o] = f"<{name}>"
         new_subs[n] = f"<{name}>"
     return old_subs, new_subs
+
+
+_VAR_REF = re.compile(r"\$\{?([A-Za-z_]\w*)")
+
+
+def built_alike(old, new, raw_old, raw_new, moved):
+    """True if an entry is written the same way in both revisions.
+
+    The text must be identical, and so must the definition of every variable
+    it reaches, directly or through other variables -- except the version
+    variables in `moved`, whose new value VERSION_VALUE has vetted. Two such
+    entries can differ only where a version moved, whatever the entry does
+    with it.
+
+    rakudo-bin is why this exists. It writes `rakudo-moar-${pkgver//_/-}`, so
+    its URL carries `2026.09-01` while pkgver is `2026.09_01`: replacing the
+    literal value never matched, and every release stopped the nightly run.
+    hardened_malloc fetches `#tag=$pkgver` with pkgver `13`, a value too short
+    to be replaced at all.
+
+    Asking only whether the new text yields the old URL at the old version
+    would not do: `${pkgver/1.2.4/anything}` yields the old URL at every
+    version except the one being introduced. The same trick inside a helper
+    variable is why the definitions are followed, not only the entry's text.
+    """
+    if raw_old != raw_new:
+        return False
+    seen = set()
+    todo = set(_VAR_REF.findall(raw_old))
+    while todo:
+        name = todo.pop()
+        if name in seen or name in moved:
+            continue
+        seen.add(name)
+        if (old.scalars.get(name) != new.scalars.get(name)
+                or old.arrays.get(name) != new.arrays.get(name)):
+            return False
+        todo.update(_VAR_REF.findall(old.scalars.get(name) or ""))
+        for value in old.arrays.get(name) or []:
+            todo.update(_VAR_REF.findall(value))
+    return True
+
+
+def same_but_version(old, new, name, moved, o, n):
+    """True if array `name` differs between the revisions only by a version bump.
+
+    `o` and `n` are its expanded entries with literal versions already replaced
+    by `version_placeholders()`. Each entry has to be equal there or be built
+    alike.
+    """
+    raw_o, raw_n = old.arrays.get(name, []), new.arrays.get(name, [])
+    if len(raw_o) != len(raw_n) or len(o) != len(n):
+        return False
+    return all(a == b or built_alike(old, new, ra, rb, moved)
+               for a, b, ra, rb in zip(o, n, raw_o, raw_n))
 
 
 def apply_subs(value, subs):
@@ -763,17 +841,18 @@ def review(repo, old_rev, new_rev, check_deps=True, strict_functions=True):
     except ScanError as e:
         return [Finding("unparsable", f"new PKGBUILD: {e}")]
 
-    old_subs, new_subs = version_placeholders(old, new)
-    version_changed = bool(old_subs)
+    moved = moved_versions(old, new)
+    old_subs, new_subs = version_placeholders(moved)
+    version_changed = bool(moved)
 
-    source_findings = _check_sources(old, new, old_subs, new_subs)
+    source_findings = _check_sources(old, new, moved, old_subs, new_subs)
 
     findings += _check_functions(old, new, strict_functions)
     findings += _check_statements(old, new)
     findings += _check_url(old, new)
     findings += source_findings
     findings += _check_checksums(old, new, version_changed, bool(source_findings))
-    findings += _check_namespace(old, new, old_subs, new_subs)
+    findings += _check_namespace(old, new, moved, old_subs, new_subs)
     findings += _check_maintainer(old, new)
     findings += _check_obfuscation(old, new)
     findings += _check_install(repo, old_rev, new_rev, old, new)
@@ -832,13 +911,13 @@ def _check_url(old, new):
     return []
 
 
-def _check_sources(old, new, old_subs, new_subs):
+def _check_sources(old, new, moved, old_subs, new_subs):
     findings = []
     names = set(old.source_arrays()) | set(new.source_arrays())
     for name in sorted(names):
         o = [apply_subs(v, old_subs) for v in old.expanded_array(name)]
         n = [apply_subs(v, new_subs) for v in new.expanded_array(name)]
-        if o == n:
+        if same_but_version(old, new, name, moved, o, n):
             continue
         frag_o = [vcs_fragment(v) for v in o]
         frag_n = [vcs_fragment(v) for v in n]
@@ -874,15 +953,16 @@ def _check_checksums(old, new, version_changed, source_changed):
     return findings
 
 
-def _check_namespace(old, new, old_subs, new_subs):
+def _check_namespace(old, new, moved, old_subs, new_subs):
     findings = []
     for name in NAMESPACE_ARRAYS:
         # `provides=("foo=$pkgver")` moves with every bump; that is not a
         # namespace change, so the version is neutralised here as well.
-        o = sorted(apply_subs(v, old_subs) for v in old.expanded_array(name))
-        n = sorted(apply_subs(v, new_subs) for v in new.expanded_array(name))
-        if o != n:
-            findings.append(Finding(f"{name}-changed", f"{o!r} -> {n!r}"))
+        o = [apply_subs(v, old_subs) for v in old.expanded_array(name)]
+        n = [apply_subs(v, new_subs) for v in new.expanded_array(name)]
+        if sorted(o) == sorted(n) or same_but_version(old, new, name, moved, o, n):
+            continue
+        findings.append(Finding(f"{name}-changed", f"{sorted(o)!r} -> {sorted(n)!r}"))
     return findings
 
 

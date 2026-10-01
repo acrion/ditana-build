@@ -29,7 +29,6 @@
 001-kora-yellow-icon-theme	origin	git@github.com:acrion/kora-yellow-icon-theme.git
 001-libtsm	origin	https://aur.archlinux.org/libtsm.git
 001-lightdm-settings	origin	https://aur.archlinux.org/lightdm-settings.git
-001-logseq-desktop-bin	origin	https://aur.archlinux.org/logseq-desktop-bin.git
 001-monique	origin	https://aur.archlinux.org/monique.git
 001-mugshot	origin	https://aur.archlinux.org/mugshot.git
 001-nexuslua	aur	https://aur.archlinux.org/nexuslua.git
@@ -43,7 +42,6 @@
 001-paru	origin	https://aur.archlinux.org/paru.git
 001-perl-boolean	origin	https://aur.archlinux.org/perl-boolean.git
 001-pinta	origin	https://aur.archlinux.org/pinta.git
-001-python-proxy_tools	origin	https://aur.archlinux.org/python-proxy_tools.git
 001-rakudo-bin	origin	https://aur.archlinux.org/rakudo-bin.git
 001-rate-mirrors	origin	https://aur.archlinux.org/rate-mirrors.git
 001-stress-ng	origin	https://gitlab.archlinux.org/archlinux/packaging/packages/stress-ng.git
@@ -61,7 +59,6 @@
 001-xfce-wallpaper-overlay	origin	git@github.com:acrion/xfce-wallpaper-overlay.git
 001-zelph	aur	https://aur.archlinux.org/zelph.git
 001-zfs-utils	origin	https://aur.archlinux.org/zfs-utils.git
-002-python-pywebview	origin	https://aur.archlinux.org/python-pywebview.git
 002-wayland-font-dpi	origin	git@github.com:acrion/wayland-font-dpi.git
 002-zfs-autosnap	origin	git@github.com:acrion/zfs-autosnap.git
 002-zfs-dkms	origin	https://aur.archlinux.org/zfs-dkms.git

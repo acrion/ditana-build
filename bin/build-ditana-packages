@@ -747,6 +747,94 @@ def reject_dangerous_refs(pkg_dir):
                 f"remote until somebody has looked at it.")
 
 
+# The keyserver signing keys are refreshed from provides only what the key's owner
+# has signed -- such as a later expiry date, a new subkey, or a revocation --
+# and nothing appended by a third party.
+KEYSERVER = "hkps://keys.openpgp.org"
+
+
+def signing_keys_of(pkg_dir):
+    """The fingerprints a package lists under validpgpkeys, read out of .SRCINFO.
+
+    >>> signing_keys_of.parse(["pkgbase = x", "\\tvalidpgpkeys = DB2BA39D1ED967B584D65D71C09FF113BB6410D0"])
+    ['DB2BA39D1ED967B584D65D71C09FF113BB6410D0']
+    >>> signing_keys_of.parse(["\\tvalidpgpkeys = A", "\\tvalidpgpkeys = A", "\\tsource = x.tar.gz.asc"])
+    ['A']
+    """
+    path = os.path.join(pkg_dir, ".SRCINFO")
+    if not os.path.exists(path):
+        return []
+    with open(path, errors="replace") as fh:
+        return signing_keys_of.parse(fh.read().splitlines())
+
+
+def _parse_signing_keys(lines):
+    keys = []
+    for line in lines:
+        key, sep, value = line.partition("=")
+        value = value.strip()
+        if sep and key.strip() == "validpgpkeys" and value not in keys:
+            keys.append(value)
+    return keys
+
+
+signing_keys_of.parse = _parse_signing_keys
+
+
+def refresh_signing_keys(pkg_dir):
+    """Refresh the package's signing keys that the keyring already holds.
+
+    Returns the fingerprints the keyring does not hold.
+
+    A key in the keyring is a copy as of the day it was imported. Upstream goes
+    on extending its expiry, adding subkeys and, if it has to, revoking it, and
+    none of that reaches a copy nobody refreshes. rakudo-bin's signing key was
+    imported on 2026-08-22 from a keyserver that still served a copy from 2023:
+    every signature checked out only as "the key has expired", and a revocation
+    would never have arrived at all.
+
+    `--refresh-keys` updates only keys whose fingerprint is already present, so
+    the decision that matters -- whether to trust a key at all -- stays with
+    whoever imported it. A key the keyring lacks is left alone, and a source
+    signed with it stops the run, as it always did.
+
+    A refresh that fails is not an error: verification then runs against the
+    stored copy, which is what it did before this existed.
+    """
+    keys = signing_keys_of(pkg_dir)
+    held = [k for k in keys
+            if subprocess.run(["gpg", "--batch", "--list-keys", k],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0]
+    if held:
+        try:
+            r = subprocess.run(["gpg", "--batch", "--keyserver", KEYSERVER,
+                                "--refresh-keys", *held],
+                               capture_output=True, text=True, timeout=120)
+            outcome = "refreshed" if r.returncode == 0 else f"not refreshed (gpg exit {r.returncode})"
+        except subprocess.TimeoutExpired:
+            outcome = "not refreshed (no answer within 120 s)"
+        print(f"--- {len(held)} signing key(s) of {os.path.basename(pkg_dir)} "
+              f"{outcome} from {KEYSERVER}.")
+    return [k for k in keys if k not in held]
+
+
+def key_import_hint(pkg_name, missing):
+    """What the person has to do when a source is signed by a key this host lacks.
+
+    Importing stays a human act on purpose, so the message that stops the run
+    has to say which keys are meant and how, or the stop is a puzzle.
+
+    >>> print(key_import_hint("zfs-dkms", ["C33DF142657ED1F7C328A2960AB9E991C6AF658B"]))
+    zfs-dkms lists signing keys this host does not hold. If one of them made the signature, check it and import it on the build host, as the build user:
+      gpg --keyserver hkps://keys.openpgp.org --recv-keys C33DF142657ED1F7C328A2960AB9E991C6AF658B
+    """
+    return (f"{pkg_name} lists signing keys this host does not hold. If one of "
+            f"them made the signature, check it and import it on the build host, "
+            f"as the build user:\n"
+            f"  gpg --keyserver {KEYSERVER} --recv-keys {' '.join(missing)}")
+
+
 def prepare_sources(pkg_dir, is_vcs):
     """Fetch and verify the sources on the host, before the chroot build.
 
@@ -764,18 +852,29 @@ def prepare_sources(pkg_dir, is_vcs):
     This is the step most likely to stop a run for a reason outside the
     pipeline -- a checksum that no longer matches, a source that has moved, an
     upstream signing key the build host does not have -- so it reports what
-    makepkg said rather than only that makepkg failed.
+    makepkg said rather than only that makepkg failed -- and, for a signing key
+    the host lacks, what the person has to do about it.
     """
+    missing = refresh_signing_keys(pkg_dir)
     if is_vcs:
         reject_dangerous_refs(pkg_dir)
         refresh_vcs_pkgver(pkg_dir)
     else:
-        run_reporting_output(["makepkg", "--verifysource", "--noconfirm"], pkg_dir,
-                             f"the sources of {os.path.basename(pkg_dir)} "
-                             f"could not be fetched or verified")
+        # makepkg translates the phrase "unknown public key" into the language of
+        # the locale, and the check below reads it.
+        try:
+            run_reporting_output(["makepkg", "--verifysource", "--noconfirm"], pkg_dir,
+                                 f"the sources of {os.path.basename(pkg_dir)} "
+                                 f"could not be fetched or verified",
+                                 env={**os.environ, "LC_ALL": "C"})
+        except RunAborted as e:
+            if missing and "unknown public key" in str(e):
+                raise RunAborted(f"{e}\n\n"
+                                 f"{key_import_hint(os.path.basename(pkg_dir), missing)}") from None
+            raise
 
 
-def run_reporting_output(command, cwd, what):
+def run_reporting_output(command, cwd, what, env=None):
     """Run a command, stream its output, and put that output in the abort.
 
     check=True raises a CalledProcessError whose message is the argv and an
@@ -786,7 +885,8 @@ def run_reporting_output(command, cwd, what):
     dashboard and the message.
     """
     process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True, errors="replace")
+                               stderr=subprocess.STDOUT, text=True, errors="replace",
+                               env=env)
     # Bounded: a full build writes tens of thousands of lines and only the end
     # of it says why it stopped. makepkg prints its ERROR summary last, and the
     # item that actually failed just before.

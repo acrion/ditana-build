@@ -37,9 +37,10 @@ half days. That is the price of the guarantee, not a defect.
 | Path | Purpose |
 |---|---|
 | `bin/build-ditana-packages` | The pipeline: pull, review, decide, build, sign, upload, `repo-add` |
+| `bin/signing-keys-test` | Controls for the upstream signing keys a package names: only keys currently held by the host are refreshed, and a source signed using any different key halts the run with the command that imports it |
 | `bin/publish-ditana-build` | Signs and publishes what a keyless build host produced, and releases it |
 | `bin/pkgbuild-review-gate` | Classifies what each `git pull` brought in; stops the run for anything not safe by construction |
-| `bin/pkgbuild-review-gate-test` | 34 control cases for the gate — 24 attacks, 10 benign changes |
+| `bin/pkgbuild-review-gate-test` | 44 test scenarios for the gate – 30 malicious attempts, 14 harmless modifications |
 | `bin/makepkg-srcdest-preflight` | Detects cached VCS clones makepkg would refuse, before hours are spent |
 | `bin/clone-preflight` | Detects package clones `git pull` would refuse, and names each one of them |
 | `bin/clone-preflight-test` | Controls for that, checked against what git itself does |
