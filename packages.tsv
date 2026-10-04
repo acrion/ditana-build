@@ -27,10 +27,8 @@
 001-hardened_malloc	origin	https://aur.archlinux.org/hardened_malloc.git
 001-kalu	origin	https://aur.archlinux.org/kalu.git
 001-kora-yellow-icon-theme	origin	git@github.com:acrion/kora-yellow-icon-theme.git
-001-libtsm	origin	https://aur.archlinux.org/libtsm.git
 001-lightdm-settings	origin	https://aur.archlinux.org/lightdm-settings.git
 001-monique	origin	https://aur.archlinux.org/monique.git
-001-mugshot	origin	https://aur.archlinux.org/mugshot.git
 001-nexuslua	aur	https://aur.archlinux.org/nexuslua.git
 001-niri-git	origin	https://aur.archlinux.org/niri-git.git
 001-niri-settings-git	origin	https://aur.archlinux.org/niri-settings-git.git
@@ -41,10 +39,7 @@
 001-pachub	origin	https://aur.archlinux.org/pachub.git
 001-paru	origin	https://aur.archlinux.org/paru.git
 001-perl-boolean	origin	https://aur.archlinux.org/perl-boolean.git
-001-pinta	origin	https://aur.archlinux.org/pinta.git
 001-rakudo-bin	origin	https://aur.archlinux.org/rakudo-bin.git
-001-rate-mirrors	origin	https://aur.archlinux.org/rate-mirrors.git
-001-stress-ng	origin	https://gitlab.archlinux.org/archlinux/packaging/packages/stress-ng.git
 001-system76-power	origin	https://aur.archlinux.org/system76-power.git
 001-timeshift-autosnap	origin	https://aur.archlinux.org/timeshift-autosnap.git
 001-ttf-twemoji	origin	https://aur.archlinux.org/ttf-twemoji.git
